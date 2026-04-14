@@ -163,9 +163,11 @@ export async function p4Fstat(
 ): Promise<P4FileStatus> {
 	try {
 		const { stdout } = await runP4(`fstat "${filePath}"`, config, cwd);
-		const tracked = stdout.includes("depotFile");
-		const checkedOut = stdout.includes("action edit");
-		const openedForAdd = stdout.includes("action add");
+		// Match the `action` field exactly — not `headAction` / `otherAction`.
+		// p4 fstat prints fields as `... <name> <value>` per line.
+		const tracked = /^\.\.\. depotFile /m.test(stdout);
+		const checkedOut = /^\.\.\. action edit\b/m.test(stdout);
+		const openedForAdd = /^\.\.\. action add\b/m.test(stdout);
 		return { tracked, checkedOut, openedForAdd };
 	} catch {
 		// "no such file" or connection errors

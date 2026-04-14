@@ -1,5 +1,5 @@
 import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
-import { accessSync, constants } from "fs";
+import { accessSync, constants, realpathSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
@@ -145,12 +145,21 @@ export default class P4Plugin extends Plugin {
 		};
 	}
 
+	/** Resolve symlinks so p4 sees the real depot-mapped path. */
+	private resolveRealPath(abs: string): string {
+		try {
+			return realpathSync(abs);
+		} catch {
+			return abs;
+		}
+	}
+
 	private absPath(file: TAbstractFile): string {
-		return join(this.vaultPath, file.path);
+		return this.resolveRealPath(join(this.vaultPath, file.path));
 	}
 
 	private absPathFromVaultPath(vaultPath: string): string {
-		return join(this.vaultPath, vaultPath);
+		return this.resolveRealPath(join(this.vaultPath, vaultPath));
 	}
 
 	private async checkServer(): Promise<void> {
