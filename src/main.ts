@@ -3,7 +3,7 @@ import { accessSync, constants, realpathSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
-	p4Add, p4Delete, p4Edit, p4Fstat, p4Info, p4Move,
+	p4Add, p4Delete, p4Edit, p4Fstat, p4Info, p4Move, p4Opened,
 	p4Revert, p4RevertUnchanged, P4Config,
 } from "./p4";
 
@@ -168,6 +168,37 @@ export default class P4Plugin extends Plugin {
 		this.updateStatusBar(clientName);
 		if (!this.serverAvailable) {
 			console.log("obsidian-p4: P4 server not reachable or not configured");
+			return;
+		}
+		await this.scanOpenedFiles();
+	}
+
+	/**
+	 * Ask P4 which files in the workspace are already opened (edit/add/move)
+	 * and seed `fileStates` so the sidebar colors pre-existing checkouts on
+	 * plugin load and reconnect. Without this, colors only appear for files
+	 * whose state changed within the current Obsidian session.
+	 */
+	private async scanOpenedFiles(): Promise<void> {
+		const realVault = this.resolveRealPath(this.vaultPath);
+		const prefix = realVault.endsWith("/") ? realVault : realVault + "/";
+		const opened = await p4Opened(this.getP4Config(), realVault);
+
+		const newStates = new Map<string, "edit" | "add">();
+		for (const { localPath, action } of opened) {
+			if (!localPath.startsWith(prefix)) continue;
+			const vaultRel = localPath.substring(prefix.length);
+			if (!this.shouldHandle(vaultRel)) continue;
+			newStates.set(vaultRel, action);
+		}
+
+		const allPaths = new Set<string>([
+			...this.fileStates.keys(),
+			...newStates.keys(),
+		]);
+		this.fileStates = newStates;
+		for (const p of allPaths) {
+			this.applyColorToFile(p, newStates.get(p) ?? null);
 		}
 	}
 

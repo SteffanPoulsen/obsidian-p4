@@ -153,6 +153,53 @@ export async function p4Move(
 }
 
 /**
+ * List all files currently opened (for edit/add/move) in the workspace
+ * under `cwd`. Returns absolute local filesystem paths paired with the
+ * simplified action ('edit' covers edit and move/add|delete; 'add' covers
+ * add and branch). Used at startup to seed the sidebar coloring cache.
+ */
+export async function p4Opened(
+	config: P4Config,
+	cwd: string
+): Promise<{ localPath: string; action: "edit" | "add" }[]> {
+	try {
+		// -Ro: only files opened by the current user
+		// -Op: emit 'path' field in local-OS syntax (e.g. /home/… or C:\…)
+		const { stdout } = await runP4(
+			"-ztag fstat -Ro -Op ./...",
+			config,
+			cwd
+		);
+
+		const result: { localPath: string; action: "edit" | "add" }[] = [];
+		const flush = (cur: { path?: string; action?: string }) => {
+			if (!cur.path || !cur.action) return;
+			let mapped: "edit" | "add" | null = null;
+			if (cur.action === "edit" || cur.action.startsWith("move/")) mapped = "edit";
+			else if (cur.action === "add" || cur.action === "branch") mapped = "add";
+			if (mapped) result.push({ localPath: cur.path, action: mapped });
+		};
+
+		let cur: { path?: string; action?: string } = {};
+		for (const line of stdout.split("\n")) {
+			if (line.trim() === "") {
+				flush(cur);
+				cur = {};
+				continue;
+			}
+			const m = line.match(/^\.\.\. (\S+) (.*)$/);
+			if (!m) continue;
+			if (m[1] === "path") cur.path = m[2];
+			else if (m[1] === "action") cur.action = m[2];
+		}
+		flush(cur);
+		return result;
+	} catch {
+		return [];
+	}
+}
+
+/**
  * Get the P4 status of a file using fstat.
  * Returns whether the file is tracked and whether it's currently checked out.
  */
