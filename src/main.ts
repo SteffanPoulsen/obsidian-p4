@@ -33,7 +33,11 @@ export default class P4Plugin extends Plugin {
 	/** Injected style element for file explorer coloring */
 	private styleEl: HTMLStyleElement | null = null;
 
-	/** Tracks P4 state of files: vault-relative path → 'edit' | 'add' */
+	/**
+	 * P4 state of files: vault-relative path → 'edit' | 'add'.
+	 * The ONLY writer is `reconcile()`. Action handlers fire p4 commands
+	 * and then call `reconcile([paths])` to observe what stuck.
+	 */
 	private fileStates: Map<string, "edit" | "add"> = new Map();
 
 	/** Scheduled revert-if-unchanged sweeps for pre-checked-out backlinks */
@@ -88,6 +92,13 @@ export default class P4Plugin extends Plugin {
 			})
 		);
 
+		// Reconcile against ground truth whenever the user comes back to
+		// Obsidian — catches state changes made outside the plugin
+		// (submits from p4v, reverts from CLI, etc.).
+		this.registerDomEvent(window, "focus", () => {
+			this.reconcile();
+		});
+
 		// Manual commands
 		this.addCommand({
 			id: "p4-edit",
@@ -112,12 +123,23 @@ export default class P4Plugin extends Plugin {
 			name: "Reconnect to Perforce server",
 			callback: () => this.reconnect(),
 		});
+
+		this.addCommand({
+			id: "p4-refresh",
+			name: "Refresh P4 state (full vault sweep)",
+			callback: () => this.reconcile(),
+		});
 	}
 
 	onunload(): void {
 		for (const t of this.pendingReverts.values()) clearTimeout(t);
 		this.pendingReverts.clear();
-		this.revertIfUnchanged(this.lastOpenFile);
+		// Best-effort revert on shutdown — don't bother reconciling, we're
+		// tearing down.
+		const last = this.lastOpenFile;
+		if (last && this.serverAvailable && this.shouldHandle(last.path)) {
+			p4RevertUnchanged(this.absPath(last), this.getP4Config(), this.vaultPath);
+		}
 		if (this.styleEl) {
 			this.styleEl.remove();
 			this.styleEl = null;
@@ -175,19 +197,28 @@ export default class P4Plugin extends Plugin {
 			console.log("obsidian-p4: P4 server not reachable or not configured");
 			return;
 		}
-		await this.scanOpenedFiles();
+		await this.reconcile();
 	}
 
 	/**
-	 * Ask P4 which files in the workspace are already opened (edit/add/move)
-	 * and seed `fileStates` so the sidebar colors pre-existing checkouts on
-	 * plugin load and reconnect. Without this, colors only appear for files
-	 * whose state changed within the current Obsidian session.
+	 * Read p4's view of which files are opened, then update `fileStates`
+	 * and sidebar colors to match. This is the single source of truth for
+	 * state — no other code path mutates `fileStates`.
+	 *
+	 * - `paths` omitted → full sweep. Anything in `fileStates` not present
+	 *   in p4's response is dropped.
+	 * - `paths` provided → scoped reconcile for just those vault paths.
+	 *   Any input path not present in p4's response is dropped from
+	 *   `fileStates` (it's no longer opened).
 	 */
-	private async scanOpenedFiles(): Promise<void> {
+	async reconcile(paths?: string[]): Promise<void> {
+		if (!this.serverAvailable) return;
+
 		const realVault = this.resolveRealPath(this.vaultPath);
 		const prefix = realVault.endsWith("/") ? realVault : realVault + "/";
-		const opened = await p4Opened(this.getP4Config(), realVault);
+
+		const queryPaths = paths?.map((p) => this.absPathFromVaultPath(p));
+		const opened = await p4Opened(this.getP4Config(), realVault, queryPaths);
 
 		const newStates = new Map<string, "edit" | "add">();
 		for (const { localPath, action } of opened) {
@@ -197,13 +228,17 @@ export default class P4Plugin extends Plugin {
 			newStates.set(vaultRel, action);
 		}
 
-		const allPaths = new Set<string>([
-			...this.fileStates.keys(),
-			...newStates.keys(),
-		]);
-		this.fileStates = newStates;
-		for (const p of allPaths) {
-			this.applyColorToFile(p, newStates.get(p) ?? null);
+		const scope: Set<string> = paths
+			? new Set(paths)
+			: new Set([...this.fileStates.keys(), ...newStates.keys()]);
+
+		for (const p of scope) {
+			const next = newStates.get(p) ?? null;
+			const prev = this.fileStates.get(p) ?? null;
+			if (next === prev) continue;
+			if (next === null) this.fileStates.delete(p);
+			else this.fileStates.set(p, next);
+			this.applyColorToFile(p, next);
 		}
 	}
 
@@ -241,16 +276,6 @@ export default class P4Plugin extends Plugin {
 	}
 
 	// ── File explorer coloring ──────────────────────────────────────
-
-	private setFileState(vaultPath: string, state: "edit" | "add"): void {
-		this.fileStates.set(vaultPath, state);
-		this.applyColorToFile(vaultPath, state);
-	}
-
-	private clearFileState(vaultPath: string): void {
-		this.fileStates.delete(vaultPath);
-		this.applyColorToFile(vaultPath, null);
-	}
 
 	private applyColorToFile(vaultPath: string, state: "edit" | "add" | null, retries = 10): void {
 		const explorers = this.app.workspace.getLeavesOfType("file-explorer");
@@ -312,12 +337,8 @@ export default class P4Plugin extends Plugin {
 		const status = await p4Fstat(abs, this.getP4Config(), this.vaultPath);
 		if (!status.tracked || status.checkedOut) return;
 
-		const success = await p4Edit(abs, this.getP4Config(), this.vaultPath);
-		if (success) {
-			this.setFileState(file.path, "edit");
-		} else {
-			console.warn(`obsidian-p4: Failed to checkout ${file.path}`);
-		}
+		await p4Edit(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([file.path]);
 	}
 
 	/** Let P4 decide if the file differs from depot — revert if not. */
@@ -326,10 +347,8 @@ export default class P4Plugin extends Plugin {
 		if (!this.shouldHandle(file.path)) return;
 
 		const abs = this.absPath(file);
-		const reverted = await p4RevertUnchanged(abs, this.getP4Config(), this.vaultPath);
-		if (reverted) {
-			this.clearFileState(file.path);
-		}
+		await p4RevertUnchanged(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([file.path]);
 	}
 
 	// ── File lifecycle (create / delete / rename) ───────────────────
@@ -340,11 +359,8 @@ export default class P4Plugin extends Plugin {
 		if (!this.shouldHandle(file.path)) return;
 
 		const abs = this.absPath(file);
-		const success = await p4Add(abs, this.getP4Config(), this.vaultPath);
-		if (success) {
-			this.setFileState(file.path, "add");
-			console.log(`obsidian-p4: Added ${file.path}`);
-		}
+		await p4Add(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([file.path]);
 	}
 
 	private async onFileDelete(file: TAbstractFile): Promise<void> {
@@ -357,14 +373,10 @@ export default class P4Plugin extends Plugin {
 
 		if (status.openedForAdd) {
 			await p4Revert(abs, this.getP4Config(), this.vaultPath);
-			console.log(`obsidian-p4: Reverted add for ${file.path}`);
 		} else if (status.tracked) {
-			const success = await p4Delete(abs, this.getP4Config(), this.vaultPath);
-			if (success) {
-				console.log(`obsidian-p4: Deleted ${file.path}`);
-			}
+			await p4Delete(abs, this.getP4Config(), this.vaultPath);
 		}
-		this.clearFileState(file.path);
+		await this.reconcile([file.path]);
 	}
 
 	private async onFileRename(file: TAbstractFile, oldPath: string): Promise<void> {
@@ -382,15 +394,16 @@ export default class P4Plugin extends Plugin {
 				const oldChildPath = oldPrefix + child.path.substring(newPrefix.length);
 				return this.handleFileRename(child, oldChildPath);
 			}));
-			// Re-sync state from p4: folder-rename edge cases (renaming
-			// back, partial failures) can leave fileStates out of step
-			// with what `p4 opened` actually reports.
-			await this.scanOpenedFiles();
+			// Folder renames touch many paths and per-child reconciles
+			// can race with each other on the old paths — full sweep is
+			// both simpler and cheaper at this scale.
+			await this.reconcile();
 			return;
 		}
 
 		if (!(file instanceof TFile)) return;
 		await this.handleFileRename(file, oldPath);
+		await this.reconcile([oldPath, file.path]);
 	}
 
 	private async handleFileRename(file: TFile, oldPath: string): Promise<void> {
@@ -405,30 +418,22 @@ export default class P4Plugin extends Plugin {
 		const absNew = this.absPath(file);
 		const status = await p4Fstat(absOld, this.getP4Config(), this.vaultPath);
 
-		this.clearFileState(oldPath);
-
 		if (status.openedForAdd) {
 			await p4Revert(absOld, this.getP4Config(), this.vaultPath);
 			await p4Add(absNew, this.getP4Config(), this.vaultPath);
-			this.setFileState(file.path, "add");
-			console.log(`obsidian-p4: Re-added as ${file.path}`);
 		} else if (status.tracked) {
-			const success = await p4Move(absOld, absNew, this.getP4Config(), this.vaultPath);
-			if (success) {
-				// p4 move -k skipped the workspace operation, so the
-				// new path is still read-only. Flip it ourselves.
-				try {
-					const mode = statSync(absNew).mode;
-					chmodSync(absNew, mode | 0o200);
-				} catch (e) {
-					console.warn(`obsidian-p4: chmod +w failed for ${file.path}`, e);
-				}
-				this.setFileState(file.path, "edit");
-				console.log(`obsidian-p4: Moved ${oldPath} → ${file.path}`);
+			await p4Move(absOld, absNew, this.getP4Config(), this.vaultPath);
+			// p4 move -k skipped the workspace operation, so the new path
+			// is still read-only on disk. Flip it ourselves — harmless if
+			// the move call quietly failed, and necessary if it succeeded.
+			try {
+				const mode = statSync(absNew).mode;
+				chmodSync(absNew, mode | 0o200);
+			} catch (e) {
+				console.warn(`obsidian-p4: chmod +w failed for ${file.path}`, e);
 			}
 		} else {
 			await p4Add(absNew, this.getP4Config(), this.vaultPath);
-			this.setFileState(file.path, "add");
 		}
 	}
 
@@ -469,9 +474,10 @@ export default class P4Plugin extends Plugin {
 	/**
 	 * Two-step checkout: synchronous chmod +w (sub-millisecond) so Obsidian's
 	 * imminent wikilink write lands on a writable file, then async `p4 edit`
-	 * to register the open with P4. If `p4 edit` fails (file isn't tracked),
-	 * restore the original mode so we don't leave a writable-but-untracked
-	 * file behind.
+	 * to register the open with P4. If the file wasn't actually tracked,
+	 * the reconcile that follows will leave it out of `fileStates`; restore
+	 * the original mode in that case so we don't leave a writable-but-
+	 * untracked file behind.
 	 */
 	private async preCheckoutBacklink(vaultPath: string): Promise<void> {
 		const abs = this.absPathFromVaultPath(vaultPath);
@@ -487,9 +493,10 @@ export default class P4Plugin extends Plugin {
 			return;
 		}
 
-		const success = await p4Edit(abs, this.getP4Config(), this.vaultPath);
-		if (success) {
-			this.setFileState(vaultPath, "edit");
+		await p4Edit(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([vaultPath]);
+
+		if (this.fileStates.has(vaultPath)) {
 			// If the user declined the link-update prompt (or the link
 			// didn't actually change), this checkout has no diff. Sweep
 			// it after a few seconds — `p4 revert -a` keeps it open if
@@ -506,8 +513,8 @@ export default class P4Plugin extends Plugin {
 		const t = setTimeout(async () => {
 			this.pendingReverts.delete(vaultPath);
 			const abs = this.absPathFromVaultPath(vaultPath);
-			const reverted = await p4RevertUnchanged(abs, this.getP4Config(), this.vaultPath);
-			if (reverted) this.clearFileState(vaultPath);
+			await p4RevertUnchanged(abs, this.getP4Config(), this.vaultPath);
+			await this.reconcile([vaultPath]);
 		}, delayMs);
 		this.pendingReverts.set(vaultPath, t);
 	}
@@ -526,9 +533,9 @@ export default class P4Plugin extends Plugin {
 		}
 
 		const abs = this.absPath(file);
-		const success = await p4Edit(abs, this.getP4Config(), this.vaultPath);
-		if (success) {
-			this.setFileState(file.path, "edit");
+		await p4Edit(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([file.path]);
+		if (this.fileStates.get(file.path) === "edit") {
 			new Notice(`Checked out: ${file.name}`);
 		} else {
 			new Notice(`Failed to checkout: ${file.name}`);
@@ -547,9 +554,9 @@ export default class P4Plugin extends Plugin {
 		}
 
 		const abs = this.absPath(file);
-		const success = await p4Revert(abs, this.getP4Config(), this.vaultPath);
-		if (success) {
-			this.clearFileState(file.path);
+		await p4Revert(abs, this.getP4Config(), this.vaultPath);
+		await this.reconcile([file.path]);
+		if (!this.fileStates.has(file.path)) {
 			new Notice(`Reverted: ${file.name}`);
 		} else {
 			new Notice(`Failed to revert: ${file.name}`);

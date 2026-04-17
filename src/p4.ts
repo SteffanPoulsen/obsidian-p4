@@ -64,149 +64,122 @@ export async function p4Info(
 	}
 }
 
-/** Open a file for edit (checkout). */
-export async function p4Edit(
-	filePath: string,
-	config: P4Config,
-	cwd: string
-): Promise<boolean> {
-	try {
-		const { stdout } = await runP4(`edit "${filePath}"`, config, cwd);
-		// p4 edit prints "//depot/path#rev - opened for edit" on success
-		return stdout.includes("opened for edit");
-	} catch {
-		return false;
-	}
+// ── Actions ─────────────────────────────────────────────────────
+//
+// These are fire-and-forget requests to p4. They do not return
+// state — the plugin reconciles via `p4Opened` after each action
+// to learn what actually stuck.
+
+export async function p4Edit(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`edit "${filePath}"`, config, cwd); } catch {}
 }
 
-/** Revert a file (undo checkout, restore read-only). */
-export async function p4Revert(
-	filePath: string,
-	config: P4Config,
-	cwd: string
-): Promise<boolean> {
-	try {
-		const { stdout } = await runP4(`revert "${filePath}"`, config, cwd);
-		return stdout.includes("reverted") || stdout.includes("was edit");
-	} catch {
-		return false;
-	}
+export async function p4Revert(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`revert "${filePath}"`, config, cwd); } catch {}
 }
 
-/** Revert a file only if its content matches the depot version. */
-export async function p4RevertUnchanged(
-	filePath: string,
-	config: P4Config,
-	cwd: string
-): Promise<boolean> {
-	try {
-		const { stdout } = await runP4(`revert -a "${filePath}"`, config, cwd);
-		return stdout.includes("reverted");
-	} catch {
-		return false;
-	}
+export async function p4RevertUnchanged(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`revert -a "${filePath}"`, config, cwd); } catch {}
 }
 
-/** Mark a new file for add. */
-export async function p4Add(
-	filePath: string,
-	config: P4Config,
-	cwd: string
-): Promise<boolean> {
-	try {
-		const { stdout } = await runP4(`add "${filePath}"`, config, cwd);
-		return stdout.includes("opened for add");
-	} catch {
-		return false;
-	}
+export async function p4Add(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`add "${filePath}"`, config, cwd); } catch {}
 }
 
-/** Mark a file for delete. */
-export async function p4Delete(
-	filePath: string,
-	config: P4Config,
-	cwd: string
-): Promise<boolean> {
-	try {
-		const { stdout } = await runP4(`delete "${filePath}"`, config, cwd);
-		return stdout.includes("opened for delete");
-	} catch {
-		return false;
-	}
+export async function p4Delete(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`delete "${filePath}"`, config, cwd); } catch {}
 }
 
 /**
- * Move/rename a file. The `-k` flags tell p4 the workspace file has
- * already been moved externally (Obsidian renamed it before our handler
- * fires), so p4 just updates its records instead of trying to rename
- * the file itself — which would fail because the source no longer
- * exists at the old path on disk.
+ * Move/rename. `-k` tells p4 the workspace file has already been
+ * moved externally (Obsidian renamed it before our handler fires),
+ * so p4 just updates its records. p4 leaves the new path read-only
+ * after a -k move; the caller is responsible for the chmod.
  */
 export async function p4Move(
 	fromPath: string,
 	toPath: string,
 	config: P4Config,
 	cwd: string
-): Promise<boolean> {
+): Promise<void> {
 	try {
 		await runP4(`edit -k "${fromPath}"`, config, cwd);
-		const { stdout } = await runP4(`move -k "${fromPath}" "${toPath}"`, config, cwd);
-		return stdout.includes("moved from");
-	} catch {
-		return false;
-	}
+		await runP4(`move -k "${fromPath}" "${toPath}"`, config, cwd);
+	} catch {}
 }
 
+// ── Queries ─────────────────────────────────────────────────────
+
 /**
- * List all files currently opened (for edit/add/move) in the workspace
- * under `cwd`. Returns absolute local filesystem paths paired with the
- * simplified action ('edit' covers edit and move/add|delete; 'add' covers
- * add and branch). Used at startup to seed the sidebar coloring cache.
+ * Ask p4 which files are opened by the current user. With no `paths`,
+ * sweeps the workspace under `cwd`. With `paths`, queries each file
+ * individually (in parallel) — needed because `p4 fstat` exits non-zero
+ * when given a mix of opened and unopened paths, which would lose
+ * partial output.
+ *
+ * Returns absolute local-OS paths paired with the visual action:
+ *   'edit' covers `edit` and `move/add` (the destination of a move).
+ *   'add'  covers `add` and `branch`.
+ * `move/delete` and `delete` are intentionally skipped — they describe
+ * paths that no longer exist on disk and have no sidebar item to color.
  */
 export async function p4Opened(
 	config: P4Config,
-	cwd: string
+	cwd: string,
+	paths?: string[]
 ): Promise<{ localPath: string; action: "edit" | "add" }[]> {
-	try {
-		// -Ro: only files opened by the current user
-		// -Op: emit 'path' field in local-OS syntax (e.g. /home/… or C:\…)
-		const { stdout } = await runP4(
-			"-ztag fstat -Ro -Op ./...",
-			config,
-			cwd
-		);
-
-		const result: { localPath: string; action: "edit" | "add" }[] = [];
-		const flush = (cur: { path?: string; action?: string }) => {
-			if (!cur.path || !cur.action) return;
-			let mapped: "edit" | "add" | null = null;
-			if (cur.action === "edit" || cur.action.startsWith("move/")) mapped = "edit";
-			else if (cur.action === "add" || cur.action === "branch") mapped = "add";
-			if (mapped) result.push({ localPath: cur.path, action: mapped });
-		};
-
-		let cur: { path?: string; action?: string } = {};
-		for (const line of stdout.split("\n")) {
-			if (line.trim() === "") {
-				flush(cur);
-				cur = {};
-				continue;
+	if (paths && paths.length > 0) {
+		const results = await Promise.all(paths.map(async (p) => {
+			try {
+				const { stdout } = await runP4(`-ztag fstat -Op "${p}"`, config, cwd);
+				return parseOpenedRecords(stdout);
+			} catch {
+				return [];
 			}
-			const m = line.match(/^\.\.\. (\S+) (.*)$/);
-			if (!m) continue;
-			if (m[1] === "path") cur.path = m[2];
-			else if (m[1] === "action") cur.action = m[2];
-		}
-		flush(cur);
-		return result;
+		}));
+		return results.flat();
+	}
+
+	try {
+		const { stdout } = await runP4("-ztag fstat -Ro -Op ./...", config, cwd);
+		return parseOpenedRecords(stdout);
 	} catch {
 		return [];
 	}
 }
 
+function parseOpenedRecords(
+	stdout: string
+): { localPath: string; action: "edit" | "add" }[] {
+	const result: { localPath: string; action: "edit" | "add" }[] = [];
+	const flush = (cur: { path?: string; action?: string }) => {
+		if (!cur.path || !cur.action) return;
+		let mapped: "edit" | "add" | null = null;
+		if (cur.action === "edit" || cur.action === "move/add") mapped = "edit";
+		else if (cur.action === "add" || cur.action === "branch") mapped = "add";
+		if (mapped) result.push({ localPath: cur.path, action: mapped });
+	};
+
+	let cur: { path?: string; action?: string } = {};
+	for (const line of stdout.split("\n")) {
+		if (line.trim() === "") {
+			flush(cur);
+			cur = {};
+			continue;
+		}
+		const m = line.match(/^\.\.\. (\S+) (.*)$/);
+		if (!m) continue;
+		if (m[1] === "path") cur.path = m[2];
+		else if (m[1] === "action") cur.action = m[2];
+	}
+	flush(cur);
+	return result;
+}
+
 /**
- * Get the P4 status of a file using fstat.
- * Returns whether the file is tracked and whether it's currently checked out.
+ * Get the P4 status of a file using fstat. Used as a query to branch
+ * action handlers (e.g. rename → move vs add) — not as a state source
+ * for sidebar coloring. Coloring goes through `p4Opened` + `reconcile`.
  */
 export async function p4Fstat(
 	filePath: string,
@@ -222,7 +195,6 @@ export async function p4Fstat(
 		const openedForAdd = /^\.\.\. action add\b/m.test(stdout);
 		return { tracked, checkedOut, openedForAdd };
 	} catch {
-		// "no such file" or connection errors
 		return { tracked: false, checkedOut: false, openedForAdd: false };
 	}
 }
