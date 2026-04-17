@@ -135,7 +135,13 @@ export async function p4Delete(
 	}
 }
 
-/** Move/rename a file. Requires the source to be opened for edit. */
+/**
+ * Move/rename a file. The `-k` flags tell p4 the workspace file has
+ * already been moved externally (Obsidian renamed it before our handler
+ * fires), so p4 just updates its records instead of trying to rename
+ * the file itself — which would fail because the source no longer
+ * exists at the old path on disk.
+ */
 export async function p4Move(
 	fromPath: string,
 	toPath: string,
@@ -143,9 +149,8 @@ export async function p4Move(
 	cwd: string
 ): Promise<boolean> {
 	try {
-		// Ensure source is open for edit first
-		await runP4(`edit "${fromPath}"`, config, cwd);
-		const { stdout } = await runP4(`move "${fromPath}" "${toPath}"`, config, cwd);
+		await runP4(`edit -k "${fromPath}"`, config, cwd);
+		const { stdout } = await runP4(`move -k "${fromPath}" "${toPath}"`, config, cwd);
 		return stdout.includes("moved from");
 	} catch {
 		return false;

@@ -1,5 +1,5 @@
-import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
-import { accessSync, constants, realpathSync } from "fs";
+import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { accessSync, chmodSync, constants, realpathSync, statSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
@@ -35,6 +35,9 @@ export default class P4Plugin extends Plugin {
 
 	/** Tracks P4 state of files: vault-relative path → 'edit' | 'add' */
 	private fileStates: Map<string, "edit" | "add"> = new Map();
+
+	/** Scheduled revert-if-unchanged sweeps for pre-checked-out backlinks */
+	private pendingReverts: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -112,6 +115,8 @@ export default class P4Plugin extends Plugin {
 	}
 
 	onunload(): void {
+		for (const t of this.pendingReverts.values()) clearTimeout(t);
+		this.pendingReverts.clear();
 		this.revertIfUnchanged(this.lastOpenFile);
 		if (this.styleEl) {
 			this.styleEl.remove();
@@ -247,18 +252,35 @@ export default class P4Plugin extends Plugin {
 		this.applyColorToFile(vaultPath, null);
 	}
 
-	private applyColorToFile(vaultPath: string, state: "edit" | "add" | null): void {
+	private applyColorToFile(vaultPath: string, state: "edit" | "add" | null, retries = 10): void {
 		const explorers = this.app.workspace.getLeavesOfType("file-explorer");
+		let found = false;
 		for (const leaf of explorers) {
 			const fileItems = (leaf.view as any).fileItems as
-				Record<string, { el: HTMLDivElement } | undefined> | undefined;
+				Record<string, { el: HTMLDivElement; file?: { path: string } } | undefined> | undefined;
 			if (!fileItems) continue;
-			const item = fileItems[vaultPath];
+			let item = fileItems[vaultPath];
+			if (!item) {
+				// fileItems isn't always re-keyed immediately after a
+				// rename — fall back to matching the entry's TFile.path
+				// so we still find the right DOM node.
+				for (const key in fileItems) {
+					const candidate = fileItems[key];
+					if (candidate?.file?.path === vaultPath) {
+						item = candidate;
+						break;
+					}
+				}
+			}
 			if (!item) continue;
+			found = true;
 			item.el.classList.remove("p4-edit", "p4-add");
 			if (state) {
 				item.el.classList.add(`p4-${state}`);
 			}
+		}
+		if (!found && state !== null && retries > 0) {
+			requestAnimationFrame(() => this.applyColorToFile(vaultPath, state, retries - 1));
 		}
 	}
 
@@ -347,14 +369,42 @@ export default class P4Plugin extends Plugin {
 
 	private async onFileRename(file: TAbstractFile, oldPath: string): Promise<void> {
 		if (!this.serverAvailable) return;
-		if (!(file instanceof TFile)) return;
 		if (!this.shouldHandle(file.path)) return;
+
+		if (file instanceof TFolder) {
+			// Obsidian fires one rename for the folder; child files don't
+			// get individual events. Walk the tree and p4-move each so the
+			// depot follows the move instead of waiting for reconcile.
+			const children = this.collectFiles(file);
+			const oldPrefix = oldPath;
+			const newPrefix = file.path;
+			await Promise.all(children.map((child) => {
+				const oldChildPath = oldPrefix + child.path.substring(newPrefix.length);
+				return this.handleFileRename(child, oldChildPath);
+			}));
+			// Re-sync state from p4: folder-rename edge cases (renaming
+			// back, partial failures) can leave fileStates out of step
+			// with what `p4 opened` actually reports.
+			await this.scanOpenedFiles();
+			return;
+		}
+
+		if (!(file instanceof TFile)) return;
+		await this.handleFileRename(file, oldPath);
+	}
+
+	private async handleFileRename(file: TFile, oldPath: string): Promise<void> {
+		if (!this.shouldHandle(file.path)) return;
+
+		// Pre-emptively check out files that link to this one. Obsidian is
+		// about to rewrite their wikilinks; without this, those writes hit
+		// read-only files and silently fail.
+		this.checkoutBacklinks(file, oldPath);
 
 		const absOld = this.absPathFromVaultPath(oldPath);
 		const absNew = this.absPath(file);
 		const status = await p4Fstat(absOld, this.getP4Config(), this.vaultPath);
 
-		// Clear old state
 		this.clearFileState(oldPath);
 
 		if (status.openedForAdd) {
@@ -365,6 +415,14 @@ export default class P4Plugin extends Plugin {
 		} else if (status.tracked) {
 			const success = await p4Move(absOld, absNew, this.getP4Config(), this.vaultPath);
 			if (success) {
+				// p4 move -k skipped the workspace operation, so the
+				// new path is still read-only. Flip it ourselves.
+				try {
+					const mode = statSync(absNew).mode;
+					chmodSync(absNew, mode | 0o200);
+				} catch (e) {
+					console.warn(`obsidian-p4: chmod +w failed for ${file.path}`, e);
+				}
 				this.setFileState(file.path, "edit");
 				console.log(`obsidian-p4: Moved ${oldPath} → ${file.path}`);
 			}
@@ -372,6 +430,86 @@ export default class P4Plugin extends Plugin {
 			await p4Add(absNew, this.getP4Config(), this.vaultPath);
 			this.setFileState(file.path, "add");
 		}
+	}
+
+	private collectFiles(folder: TFolder): TFile[] {
+		const out: TFile[] = [];
+		const walk = (f: TFolder): void => {
+			for (const child of f.children) {
+				if (child instanceof TFile) out.push(child);
+				else if (child instanceof TFolder) walk(child);
+			}
+		};
+		walk(folder);
+		return out;
+	}
+
+	/**
+	 * Find every file that wikilinks to the renamed file and checkout each
+	 * one before Obsidian rewrites its links. Uses `resolvedLinks`, which
+	 * still reflects pre-rename state when this fires.
+	 */
+	private checkoutBacklinks(file: TFile, oldPath: string): void {
+		const resolved = this.app.metadataCache.resolvedLinks;
+		const sources = new Set<string>();
+		for (const sourcePath of Object.keys(resolved)) {
+			const targets = resolved[sourcePath];
+			if (!targets) continue;
+			if (!(oldPath in targets) && !(file.path in targets)) continue;
+			if (sourcePath === oldPath || sourcePath === file.path) continue;
+			if (!this.shouldHandle(sourcePath)) continue;
+			sources.add(sourcePath);
+		}
+
+		for (const sourcePath of sources) {
+			this.preCheckoutBacklink(sourcePath);
+		}
+	}
+
+	/**
+	 * Two-step checkout: synchronous chmod +w (sub-millisecond) so Obsidian's
+	 * imminent wikilink write lands on a writable file, then async `p4 edit`
+	 * to register the open with P4. If `p4 edit` fails (file isn't tracked),
+	 * restore the original mode so we don't leave a writable-but-untracked
+	 * file behind.
+	 */
+	private async preCheckoutBacklink(vaultPath: string): Promise<void> {
+		const abs = this.absPathFromVaultPath(vaultPath);
+		if (this.fileStates.has(vaultPath)) return;
+		if (!this.isReadOnly(abs)) return;
+
+		let originalMode: number;
+		try {
+			originalMode = statSync(abs).mode;
+			chmodSync(abs, originalMode | 0o200);
+		} catch (e) {
+			console.warn(`obsidian-p4: chmod +w failed for ${vaultPath}`, e);
+			return;
+		}
+
+		const success = await p4Edit(abs, this.getP4Config(), this.vaultPath);
+		if (success) {
+			this.setFileState(vaultPath, "edit");
+			// If the user declined the link-update prompt (or the link
+			// didn't actually change), this checkout has no diff. Sweep
+			// it after a few seconds — `p4 revert -a` keeps it open if
+			// the file was modified, drops it otherwise.
+			this.scheduleRevertIfUnchanged(vaultPath, 5000);
+		} else {
+			try { chmodSync(abs, originalMode); } catch {}
+		}
+	}
+
+	private scheduleRevertIfUnchanged(vaultPath: string, delayMs: number): void {
+		const existing = this.pendingReverts.get(vaultPath);
+		if (existing) clearTimeout(existing);
+		const t = setTimeout(async () => {
+			this.pendingReverts.delete(vaultPath);
+			const abs = this.absPathFromVaultPath(vaultPath);
+			const reverted = await p4RevertUnchanged(abs, this.getP4Config(), this.vaultPath);
+			if (reverted) this.clearFileState(vaultPath);
+		}, delayMs);
+		this.pendingReverts.set(vaultPath, t);
 	}
 
 	// ── Manual commands ──────────────────────────────────────────────
