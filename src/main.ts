@@ -3,8 +3,8 @@ import { accessSync, chmodSync, constants, realpathSync, statSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
-	p4Add, p4Delete, p4Edit, p4Fstat, p4Info, p4Move, p4Opened,
-	p4Revert, p4RevertUnchanged, P4Config,
+	p4Add, p4Delete, p4DeleteKeep, p4Edit, p4Fstat, p4Info, p4Move, p4Opened,
+	p4Revert, p4RevertKeep, p4RevertUnchanged, P4Config, P4FileStatus,
 } from "./p4";
 
 const P4_STYLES = `
@@ -15,6 +15,10 @@ const P4_STYLES = `
 .nav-file.p4-add > .nav-file-title > .nav-file-title-content,
 .tree-item.p4-add > .tree-item-self > .tree-item-inner {
 	color: var(--color-green) !important;
+}
+.nav-file.p4-delete > .nav-file-title > .nav-file-title-content,
+.tree-item.p4-delete > .tree-item-self > .tree-item-inner {
+	color: var(--color-red) !important;
 }
 `;
 
@@ -38,10 +42,13 @@ export default class P4Plugin extends Plugin {
 	 * The ONLY writer is `reconcile()`. Action handlers fire p4 commands
 	 * and then call `reconcile([paths])` to observe what stuck.
 	 */
-	private fileStates: Map<string, "edit" | "add"> = new Map();
+	private fileStates: Map<string, "edit" | "add" | "delete"> = new Map();
 
 	/** Scheduled revert-if-unchanged sweeps for pre-checked-out backlinks */
 	private pendingReverts: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+	/** Original FileManager.promptForDeletion, saved so onunload can restore it. */
+	private origPromptForDeletion: ((file: TAbstractFile) => Promise<boolean>) | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -58,6 +65,11 @@ export default class P4Plugin extends Plugin {
 
 		// Check P4 connectivity on startup
 		this.checkServer();
+
+		// Make Obsidian's native delete P4-aware: tracked files are staged
+		// for delete and kept on disk (so they stay visible and turn red)
+		// instead of being removed outright. See patchDeletePrompt.
+		this.patchDeletePrompt();
 
 		// Auto-checkout when a file is opened
 		this.registerEvent(
@@ -132,6 +144,12 @@ export default class P4Plugin extends Plugin {
 	}
 
 	onunload(): void {
+		// Restore the original delete handler we wrapped in onload.
+		if (this.origPromptForDeletion) {
+			(this.app.fileManager as any).promptForDeletion = this.origPromptForDeletion;
+			this.origPromptForDeletion = null;
+		}
+
 		for (const t of this.pendingReverts.values()) clearTimeout(t);
 		this.pendingReverts.clear();
 		// Best-effort revert on shutdown — don't bother reconciling, we're
@@ -220,7 +238,7 @@ export default class P4Plugin extends Plugin {
 		const queryPaths = paths?.map((p) => this.absPathFromVaultPath(p));
 		const opened = await p4Opened(this.getP4Config(), realVault, queryPaths);
 
-		const newStates = new Map<string, "edit" | "add">();
+		const newStates = new Map<string, "edit" | "add" | "delete">();
 		for (const { localPath, action } of opened) {
 			if (!localPath.startsWith(prefix)) continue;
 			const vaultRel = localPath.substring(prefix.length);
@@ -277,7 +295,7 @@ export default class P4Plugin extends Plugin {
 
 	// ── File explorer coloring ──────────────────────────────────────
 
-	private applyColorToFile(vaultPath: string, state: "edit" | "add" | null, retries = 10): void {
+	private applyColorToFile(vaultPath: string, state: "edit" | "add" | "delete" | null, retries = 10): void {
 		const explorers = this.app.workspace.getLeavesOfType("file-explorer");
 		let found = false;
 		for (const leaf of explorers) {
@@ -299,7 +317,7 @@ export default class P4Plugin extends Plugin {
 			}
 			if (!item) continue;
 			found = true;
-			item.el.classList.remove("p4-edit", "p4-add");
+			item.el.classList.remove("p4-edit", "p4-add", "p4-delete");
 			if (state) {
 				item.el.classList.add(`p4-${state}`);
 			}
@@ -335,7 +353,7 @@ export default class P4Plugin extends Plugin {
 
 		// Check if this file is actually tracked in P4
 		const status = await p4Fstat(abs, this.getP4Config(), this.vaultPath);
-		if (!status.tracked || status.checkedOut) return;
+		if (!status.tracked || status.checkedOut || status.openedForDelete) return;
 
 		await p4Edit(abs, this.getP4Config(), this.vaultPath);
 		await this.reconcile([file.path]);
@@ -373,10 +391,132 @@ export default class P4Plugin extends Plugin {
 
 		if (status.openedForAdd) {
 			await p4Revert(abs, this.getP4Config(), this.vaultPath);
-		} else if (status.tracked) {
+		} else if (status.tracked && !status.openedForDelete) {
+			// p4 won't delete a file that's still open for edit; clear the
+			// open first, without restoring the already-gone file to disk.
+			if (status.checkedOut) {
+				await p4RevertKeep(abs, this.getP4Config(), this.vaultPath);
+			}
 			await p4Delete(abs, this.getP4Config(), this.vaultPath);
 		}
 		await this.reconcile([file.path]);
+	}
+
+	// ── Native delete interception ───────────────────────────────────
+	//
+	// Obsidian's file-explorer Delete, the "Delete current file" command,
+	// and its hotkey all route through FileManager.promptForDeletion — a
+	// public API. Wrapping it lets a tracked file be staged for delete and
+	// kept on disk (visible + colored) instead of removed outright. Untracked
+	// files, add-pending files, and an unreachable server fall through to
+	// Obsidian's normal deletion; programmatic deletes that bypass this funnel
+	// are still caught by onFileDelete.
+
+	private patchDeletePrompt(): void {
+		const fm = this.app.fileManager as any;
+		const original = fm.promptForDeletion;
+		if (typeof original !== "function") {
+			console.warn(
+				"obsidian-p4: app.fileManager.promptForDeletion not found — " +
+				"native delete won't be P4-aware on this Obsidian version"
+			);
+			return;
+		}
+		this.origPromptForDeletion = original;
+		fm.promptForDeletion = (file: TAbstractFile): Promise<boolean> =>
+			this.handleDeletePrompt(file);
+	}
+
+	private callOriginalDelete(file: TAbstractFile): Promise<boolean> {
+		if (!this.origPromptForDeletion) return Promise.resolve(false);
+		return this.origPromptForDeletion.call(this.app.fileManager, file);
+	}
+
+	private async handleDeletePrompt(file: TAbstractFile): Promise<boolean> {
+		if (!this.serverAvailable || !this.shouldHandle(file.path)) {
+			return this.callOriginalDelete(file);
+		}
+		try {
+			if (file instanceof TFolder) return await this.markFolderForDelete(file);
+			if (file instanceof TFile) return await this.markFileForDelete(file);
+		} catch (e) {
+			// Never let a P4 hiccup turn into a lost file — leave it in place.
+			console.error("obsidian-p4: mark-for-delete failed", e);
+			new Notice(`P4: couldn't mark ${file.name} for delete — left in place`);
+			return false;
+		}
+		return this.callOriginalDelete(file);
+	}
+
+	/**
+	 * Stage a single file for delete. A tracked depot file is opened for
+	 * delete with its workspace copy kept (so it stays visible and turns
+	 * red); add-pending and untracked files fall through to a real delete,
+	 * after which onFileDelete reverts any pending add.
+	 */
+	private async markFileForDelete(file: TFile): Promise<boolean> {
+		const abs = this.absPath(file);
+		const status = await p4Fstat(abs, this.getP4Config(), this.vaultPath);
+
+		if (!status.tracked || status.openedForAdd) {
+			return this.callOriginalDelete(file);
+		}
+		if (status.openedForDelete) {
+			new Notice(`Already marked for delete: ${file.name}`);
+			return false;
+		}
+
+		await this.stageDelete(abs, status);
+		await this.reconcile([file.path]);
+		if (this.fileStates.get(file.path) === "delete") {
+			new Notice(`Marked for delete: ${file.name}`);
+		} else {
+			new Notice(`P4: couldn't mark ${file.name} for delete`);
+		}
+		return false;
+	}
+
+	/**
+	 * Stage every tracked file under a folder for delete, keeping each on
+	 * disk. Untracked / add-pending children are left untouched, so the
+	 * folder stays put holding the now-red files. If nothing under the folder
+	 * is in the depot, fall through to Obsidian's normal folder delete.
+	 */
+	private async markFolderForDelete(folder: TFolder): Promise<boolean> {
+		const cfg = this.getP4Config();
+		const children = this.collectFiles(folder);
+		const statuses = await Promise.all(
+			children.map(async (child) => ({
+				child,
+				status: await p4Fstat(this.absPath(child), cfg, this.vaultPath),
+			}))
+		);
+		const tracked = statuses.filter(
+			(s) => s.status.tracked && !s.status.openedForAdd && !s.status.openedForDelete
+		);
+
+		if (tracked.length === 0) {
+			return this.callOriginalDelete(folder);
+		}
+
+		await Promise.all(
+			tracked.map(({ child, status }) => this.stageDelete(this.absPath(child), status))
+		);
+		await this.reconcile(tracked.map((s) => s.child.path));
+		new Notice(`Marked ${tracked.length} file(s) for delete in ${folder.name}`);
+		return false;
+	}
+
+	/**
+	 * Open a tracked file for delete while keeping the workspace copy. p4
+	 * refuses to delete a file that's open for edit, so clear that first
+	 * with revert -k (which also leaves the file on disk untouched).
+	 */
+	private async stageDelete(abs: string, status: P4FileStatus): Promise<void> {
+		if (status.checkedOut) {
+			await p4RevertKeep(abs, this.getP4Config(), this.vaultPath);
+		}
+		await p4DeleteKeep(abs, this.getP4Config(), this.vaultPath);
 	}
 
 	private async onFileRename(file: TAbstractFile, oldPath: string): Promise<void> {

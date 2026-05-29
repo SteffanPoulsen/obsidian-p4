@@ -17,6 +17,8 @@ export interface P4FileStatus {
 	checkedOut: boolean;
 	/** Whether the file is currently opened for add (new, not yet in depot) */
 	openedForAdd: boolean;
+	/** Whether the file is currently opened for delete */
+	openedForDelete: boolean;
 }
 
 /**
@@ -78,6 +80,16 @@ export async function p4Revert(filePath: string, config: P4Config, cwd: string):
 	try { await runP4(`revert "${filePath}"`, config, cwd); } catch {}
 }
 
+/**
+ * Clear a pending open (edit/add) in the server's metadata without touching
+ * the workspace file (`-k`). Used before `delete -k` to drop an edit that
+ * would otherwise block the delete, and so a file that's already gone from
+ * disk isn't restored.
+ */
+export async function p4RevertKeep(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`revert -k "${filePath}"`, config, cwd); } catch {}
+}
+
 export async function p4RevertUnchanged(filePath: string, config: P4Config, cwd: string): Promise<void> {
 	try { await runP4(`revert -a "${filePath}"`, config, cwd); } catch {}
 }
@@ -88,6 +100,15 @@ export async function p4Add(filePath: string, config: P4Config, cwd: string): Pr
 
 export async function p4Delete(filePath: string, config: P4Config, cwd: string): Promise<void> {
 	try { await runP4(`delete "${filePath}"`, config, cwd); } catch {}
+}
+
+/**
+ * Open a file for delete on the server while leaving the workspace copy in
+ * place (`-k`). Lets a staged deletion stay visible in the file explorer so
+ * it can be colored — the depot drops the file on submit.
+ */
+export async function p4DeleteKeep(filePath: string, config: P4Config, cwd: string): Promise<void> {
+	try { await runP4(`delete -k "${filePath}"`, config, cwd); } catch {}
 }
 
 /**
@@ -118,16 +139,19 @@ export async function p4Move(
  * partial output.
  *
  * Returns absolute local-OS paths paired with the visual action:
- *   'edit' covers `edit` and `move/add` (the destination of a move).
- *   'add'  covers `add` and `branch`.
- * `move/delete` and `delete` are intentionally skipped — they describe
- * paths that no longer exist on disk and have no sidebar item to color.
+ *   'edit'   covers `edit` and `move/add` (the destination of a move).
+ *   'add'    covers `add` and `branch`.
+ *   'delete' covers `delete` and `move/delete`.
+ * Files opened for delete are surfaced because the plugin stages them with
+ * `delete -k`, which leaves the workspace file in place to be colored. A
+ * `move/delete` (the source of a move) has no file on disk, so coloring it
+ * is a harmless no-op.
  */
 export async function p4Opened(
 	config: P4Config,
 	cwd: string,
 	paths?: string[]
-): Promise<{ localPath: string; action: "edit" | "add" }[]> {
+): Promise<{ localPath: string; action: "edit" | "add" | "delete" }[]> {
 	if (paths && paths.length > 0) {
 		const results = await Promise.all(paths.map(async (p) => {
 			try {
@@ -150,13 +174,14 @@ export async function p4Opened(
 
 function parseOpenedRecords(
 	stdout: string
-): { localPath: string; action: "edit" | "add" }[] {
-	const result: { localPath: string; action: "edit" | "add" }[] = [];
+): { localPath: string; action: "edit" | "add" | "delete" }[] {
+	const result: { localPath: string; action: "edit" | "add" | "delete" }[] = [];
 	const flush = (cur: { path?: string; action?: string }) => {
 		if (!cur.path || !cur.action) return;
-		let mapped: "edit" | "add" | null = null;
+		let mapped: "edit" | "add" | "delete" | null = null;
 		if (cur.action === "edit" || cur.action === "move/add") mapped = "edit";
 		else if (cur.action === "add" || cur.action === "branch") mapped = "add";
+		else if (cur.action === "delete" || cur.action === "move/delete") mapped = "delete";
 		if (mapped) result.push({ localPath: cur.path, action: mapped });
 	};
 
@@ -193,8 +218,9 @@ export async function p4Fstat(
 		const tracked = /^\.\.\. depotFile /m.test(stdout);
 		const checkedOut = /^\.\.\. action edit\b/m.test(stdout);
 		const openedForAdd = /^\.\.\. action add\b/m.test(stdout);
-		return { tracked, checkedOut, openedForAdd };
+		const openedForDelete = /^\.\.\. action (delete|move\/delete)\b/m.test(stdout);
+		return { tracked, checkedOut, openedForAdd, openedForDelete };
 	} catch {
-		return { tracked: false, checkedOut: false, openedForAdd: false };
+		return { tracked: false, checkedOut: false, openedForAdd: false, openedForDelete: false };
 	}
 }

@@ -8,8 +8,9 @@ Built for teams that keep documentation alongside code in Perforce workspaces.
 
 - **Auto-checkout** — opens files for edit (`p4 edit`) when you click on them in Obsidian
 - **Auto-revert** — reverts unchanged files (`p4 revert -a`) when you navigate away, keeping your changelist clean
-- **File lifecycle** — automatically runs `p4 add`, `p4 delete`, and `p4 move` when you create, delete, or rename files
-- **Sidebar coloring** — files opened for edit show in your theme's accent color, new files show in green
+- **File lifecycle** — automatically runs `p4 add` and `p4 move` when you create or rename files
+- **Mark for delete** — deleting a tracked file or folder stages it for deletion (`p4 delete -k`) and keeps it on disk, shown in red, until you submit — instead of removing it outright
+- **Sidebar coloring** — files opened for edit show in your theme's accent color, new files in green, and files marked for delete in red
 - **Status bar** — displays your P4 workspace name and connection state
 - **Manual commands** — checkout, revert, and status commands available in the command palette
 - **Reconnect** — command palette action to reconnect if the server was unavailable at startup
@@ -69,10 +70,15 @@ Copy `main.js` and `manifest.json` to your vault's plugin folder.
 | Open a read-only `.md` file | `p4 fstat` → `p4 edit` (file becomes writable) |
 | Navigate away from an opened file | `p4 revert -a` (reverts if content matches depot) |
 | Create a new file | `p4 add` |
-| Delete a file | `p4 delete` (tracked) or `p4 revert` (pending add) |
+| Delete a tracked file or folder | `p4 delete -k` — staged for delete, kept on disk and shown red until submit |
+| Delete a pending-add or untracked file | removed normally (a pending `p4 add` is reverted first) |
 | Rename a file | `p4 move` (tracked) or revert + re-add (pending add) |
 
 Files inside `.obsidian/` are always ignored.
+
+### Delete behavior
+
+Obsidian's normal delete — right-click, the *Delete current file* command, or its hotkey — is intercepted so a tracked file is **marked** for delete rather than removed. The file stays in the explorer (shown in red) and is only removed from the depot when you submit; reverting it before then restores it. Deleting a folder marks all of its tracked contents and leaves the folder in place. Untracked files, pending adds, and anything under `.obsidian/` fall through to Obsidian's normal delete, and if the P4 server is unreachable the file is deleted as usual.
 
 ## Commands
 
