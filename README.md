@@ -10,7 +10,8 @@ Built for teams that keep documentation alongside code in Perforce workspaces.
 - **Auto-revert** — reverts unchanged files (`p4 revert -a`) when you navigate away, keeping your changelist clean
 - **File lifecycle** — automatically runs `p4 add` and `p4 move` when you create or rename files
 - **Mark for delete** — deleting a tracked file or folder stages it for deletion (`p4 delete -k`) and keeps it on disk, shown in red, until you submit — instead of removing it outright
-- **Sidebar coloring** — files opened for edit show in your theme's accent color, new files in green, and files marked for delete in red
+- **Status bars** — a colored bar on the left edge of each file shows its P4 status at a glance: muted = tracked, accent = open for edit, green = open for add, red = marked for delete (untracked files have no bar)
+- **Right-click menu** — a Perforce section on the file/folder context menu: *Add to Perforce* (start tracking new files), *Revert* (discard edits or restore a staged deletion), and *Mark for delete*
 - **Status bar** — displays your P4 workspace name and connection state
 - **Manual commands** — checkout, revert, and status commands available in the command palette
 - **Reconnect** — command palette action to reconnect if the server was unavailable at startup

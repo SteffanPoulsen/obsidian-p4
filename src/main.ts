@@ -1,26 +1,36 @@
-import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { Menu, Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { accessSync, chmodSync, constants, realpathSync, statSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
-	p4Add, p4Delete, p4DeleteKeep, p4Edit, p4Fstat, p4Info, p4Move, p4Opened,
+	p4Add, p4Delete, p4DeleteKeep, p4Edit, p4Fstat, p4Have, p4Info, p4Move, p4Opened,
 	p4Revert, p4RevertKeep, p4RevertUnchanged, P4Config, P4FileStatus,
 } from "./p4";
 
+// A single left-edge bar encodes a file's P4 status; the title text keeps its
+// normal theme color. No bar = untracked; muted = tracked/clean; accent = open
+// for edit; green = open for add; red = marked for delete.
 const P4_STYLES = `
-.nav-file.p4-edit > .nav-file-title > .nav-file-title-content,
-.tree-item.p4-edit > .tree-item-self > .tree-item-inner {
-	color: var(--text-accent) !important;
+.nav-file.p4-tracked > .nav-file-title,
+.tree-item.p4-tracked > .tree-item-self {
+	box-shadow: inset 3px 0 0 0 var(--text-muted);
 }
-.nav-file.p4-add > .nav-file-title > .nav-file-title-content,
-.tree-item.p4-add > .tree-item-self > .tree-item-inner {
-	color: var(--color-green) !important;
+.nav-file.p4-edit > .nav-file-title,
+.tree-item.p4-edit > .tree-item-self {
+	box-shadow: inset 3px 0 0 0 var(--text-accent);
 }
-.nav-file.p4-delete > .nav-file-title > .nav-file-title-content,
-.tree-item.p4-delete > .tree-item-self > .tree-item-inner {
-	color: var(--color-red) !important;
+.nav-file.p4-add > .nav-file-title,
+.tree-item.p4-add > .tree-item-self {
+	box-shadow: inset 3px 0 0 0 var(--color-green);
+}
+.nav-file.p4-delete > .nav-file-title,
+.tree-item.p4-delete > .tree-item-self {
+	box-shadow: inset 3px 0 0 0 var(--color-red);
 }
 `;
+
+/** A file's P4 status as reflected by the explorer bar. */
+type P4Bar = "tracked" | "edit" | "add" | "delete";
 
 export default class P4Plugin extends Plugin {
 	settings: P4PluginSettings = DEFAULT_SETTINGS;
@@ -38,11 +48,18 @@ export default class P4Plugin extends Plugin {
 	private styleEl: HTMLStyleElement | null = null;
 
 	/**
-	 * P4 state of files: vault-relative path → 'edit' | 'add'.
+	 * P4 open state of files: vault-relative path → 'edit' | 'add' | 'delete'.
 	 * The ONLY writer is `reconcile()`. Action handlers fire p4 commands
 	 * and then call `reconcile([paths])` to observe what stuck.
 	 */
 	private fileStates: Map<string, "edit" | "add" | "delete"> = new Map();
+
+	/**
+	 * Vault-relative paths that exist in the depot (tracked but not necessarily
+	 * open). Sourced from `p4 have`, written only by `reconcile()`. Drives the
+	 * muted "tracked" bar and the context-menu's tracked-vs-untracked logic.
+	 */
+	private trackedFiles: Set<string> = new Set();
 
 	/** Scheduled revert-if-unchanged sweeps for pre-checked-out backlinks */
 	private pendingReverts: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -78,10 +95,17 @@ export default class P4Plugin extends Plugin {
 			})
 		);
 
-		// Re-apply sidebar colors when the file explorer re-renders
+		// Re-apply sidebar bars when the file explorer re-renders
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
 				this.refreshExplorerColors();
+			})
+		);
+
+		// Bespoke Perforce section in the file/folder right-click menu
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				this.buildFileMenu(menu, file);
 			})
 		);
 
@@ -219,44 +243,63 @@ export default class P4Plugin extends Plugin {
 	}
 
 	/**
-	 * Read p4's view of which files are opened, then update `fileStates`
-	 * and sidebar colors to match. This is the single source of truth for
-	 * state — no other code path mutates `fileStates`.
+	 * Read p4's view of which files are opened (`p4 opened`) and which are in
+	 * the depot (`p4 have`), then update `fileStates` / `trackedFiles` and the
+	 * explorer bars to match. This is the single source of truth for both maps
+	 * — no other code path mutates them.
 	 *
-	 * - `paths` omitted → full sweep. Anything in `fileStates` not present
-	 *   in p4's response is dropped.
-	 * - `paths` provided → scoped reconcile for just those vault paths.
-	 *   Any input path not present in p4's response is dropped from
-	 *   `fileStates` (it's no longer opened).
+	 * - `paths` omitted → full sweep. Anything in either map not present in
+	 *   p4's response is dropped.
+	 * - `paths` provided → scoped reconcile for just those vault paths. Any
+	 *   input path not reported by p4 is dropped from both maps.
 	 */
 	async reconcile(paths?: string[]): Promise<void> {
 		if (!this.serverAvailable) return;
 
 		const realVault = this.resolveRealPath(this.vaultPath);
 		const prefix = realVault.endsWith("/") ? realVault : realVault + "/";
+		const toVaultRel = (localPath: string): string | null => {
+			if (!localPath.startsWith(prefix)) return null;
+			const rel = localPath.substring(prefix.length);
+			return this.shouldHandle(rel) ? rel : null;
+		};
 
 		const queryPaths = paths?.map((p) => this.absPathFromVaultPath(p));
-		const opened = await p4Opened(this.getP4Config(), realVault, queryPaths);
+		const [opened, have] = await Promise.all([
+			p4Opened(this.getP4Config(), realVault, queryPaths),
+			p4Have(this.getP4Config(), realVault, queryPaths),
+		]);
 
 		const newStates = new Map<string, "edit" | "add" | "delete">();
 		for (const { localPath, action } of opened) {
-			if (!localPath.startsWith(prefix)) continue;
-			const vaultRel = localPath.substring(prefix.length);
-			if (!this.shouldHandle(vaultRel)) continue;
-			newStates.set(vaultRel, action);
+			const rel = toVaultRel(localPath);
+			if (rel) newStates.set(rel, action);
+		}
+		const newTracked = new Set<string>();
+		for (const localPath of have) {
+			const rel = toVaultRel(localPath);
+			if (rel) newTracked.add(rel);
 		}
 
 		const scope: Set<string> = paths
 			? new Set(paths)
-			: new Set([...this.fileStates.keys(), ...newStates.keys()]);
+			: new Set([
+				...this.fileStates.keys(), ...this.trackedFiles,
+				...newStates.keys(), ...newTracked,
+			]);
 
 		for (const p of scope) {
-			const next = newStates.get(p) ?? null;
-			const prev = this.fileStates.get(p) ?? null;
-			if (next === prev) continue;
-			if (next === null) this.fileStates.delete(p);
-			else this.fileStates.set(p, next);
-			this.applyColorToFile(p, next);
+			const prevBar = this.barFor(p);
+
+			const nextState = newStates.get(p) ?? null;
+			if (nextState === null) this.fileStates.delete(p);
+			else this.fileStates.set(p, nextState);
+
+			if (newTracked.has(p)) this.trackedFiles.add(p);
+			else this.trackedFiles.delete(p);
+
+			// Only touch the DOM when the resulting bar actually changes.
+			if (this.barFor(p) !== prevBar) this.applyBar(p);
 		}
 	}
 
@@ -293,9 +336,16 @@ export default class P4Plugin extends Plugin {
 		}
 	}
 
-	// ── File explorer coloring ──────────────────────────────────────
+	// ── File explorer bars ──────────────────────────────────────────
 
-	private applyColorToFile(vaultPath: string, state: "edit" | "add" | "delete" | null, retries = 10): void {
+	/** The status bar a path should show: open state wins over plain tracked. */
+	private barFor(vaultPath: string): P4Bar | null {
+		return this.fileStates.get(vaultPath)
+			?? (this.trackedFiles.has(vaultPath) ? "tracked" : null);
+	}
+
+	private applyBar(vaultPath: string, retries = 10): void {
+		const bar = this.barFor(vaultPath);
 		const explorers = this.app.workspace.getLeavesOfType("file-explorer");
 		let found = false;
 		for (const leaf of explorers) {
@@ -317,19 +367,20 @@ export default class P4Plugin extends Plugin {
 			}
 			if (!item) continue;
 			found = true;
-			item.el.classList.remove("p4-edit", "p4-add", "p4-delete");
-			if (state) {
-				item.el.classList.add(`p4-${state}`);
+			item.el.classList.remove("p4-tracked", "p4-edit", "p4-add", "p4-delete");
+			if (bar) {
+				item.el.classList.add(`p4-${bar}`);
 			}
 		}
-		if (!found && state !== null && retries > 0) {
-			requestAnimationFrame(() => this.applyColorToFile(vaultPath, state, retries - 1));
+		if (!found && bar !== null && retries > 0) {
+			requestAnimationFrame(() => this.applyBar(vaultPath, retries - 1));
 		}
 	}
 
 	private refreshExplorerColors(): void {
-		for (const [path, state] of this.fileStates) {
-			this.applyColorToFile(path, state);
+		const paths = new Set([...this.fileStates.keys(), ...this.trackedFiles]);
+		for (const path of paths) {
+			this.applyBar(path);
 		}
 	}
 
@@ -517,6 +568,100 @@ export default class P4Plugin extends Plugin {
 			await p4RevertKeep(abs, this.getP4Config(), this.vaultPath);
 		}
 		await p4DeleteKeep(abs, this.getP4Config(), this.vaultPath);
+	}
+
+	// ── Perforce context menu ────────────────────────────────────────
+	//
+	// A bespoke "Perforce" section on the file/folder right-click menu, built
+	// synchronously from the cached fileStates / trackedFiles so items show
+	// only when they apply. Lets you choose what to track (Add), undo pending
+	// work including a staged deletion (Revert), and stage a delete here too.
+
+	private buildFileMenu(menu: Menu, file: TAbstractFile): void {
+		if (!this.serverAvailable || !this.shouldHandle(file.path)) return;
+
+		if (file instanceof TFolder) {
+			const children = this.collectFiles(file);
+			const untracked = children.filter((c) => this.isUntracked(c.path));
+			const opened = children.filter((c) => this.fileStates.has(c.path));
+			const deletable = children.filter(
+				(c) => this.trackedFiles.has(c.path) && this.fileStates.get(c.path) !== "delete"
+			);
+			if (untracked.length) {
+				this.addMenuItem(menu, "Add folder to Perforce", "plus-circle",
+					() => this.menuAdd(untracked, file.name));
+			}
+			if (opened.length) {
+				this.addMenuItem(menu, "Revert folder", "rotate-ccw",
+					() => this.menuRevert(opened, file.name));
+			}
+			if (deletable.length) {
+				this.addMenuItem(menu, "Mark folder for delete", "trash-2",
+					() => { void this.markFolderForDelete(file); });
+			}
+			return;
+		}
+
+		if (!(file instanceof TFile)) return;
+		const state = this.fileStates.get(file.path) ?? null;
+		const tracked = this.trackedFiles.has(file.path);
+
+		if (this.isUntracked(file.path)) {
+			this.addMenuItem(menu, "Add to Perforce", "plus-circle",
+				() => this.menuAdd([file]));
+		}
+		if (state) {
+			this.addMenuItem(menu, "Revert", "rotate-ccw",
+				() => this.menuRevert([file]));
+		}
+		if (tracked && state !== "delete") {
+			this.addMenuItem(menu, "Mark for delete", "trash-2",
+				() => { void this.markFileForDelete(file); });
+		}
+	}
+
+	private isUntracked(vaultPath: string): boolean {
+		return !this.trackedFiles.has(vaultPath) && !this.fileStates.has(vaultPath);
+	}
+
+	private addMenuItem(menu: Menu, title: string, icon: string, onClick: () => void): void {
+		menu.addItem((item) => {
+			item.setTitle(title).setIcon(icon).setSection("perforce").onClick(onClick);
+		});
+	}
+
+	/** `p4 add` a set of files, then reconcile and report. */
+	private async menuAdd(files: TFile[], folderName?: string): Promise<void> {
+		if (!files.length) return;
+		const cfg = this.getP4Config();
+		await Promise.all(files.map((f) => p4Add(this.absPath(f), cfg, this.vaultPath)));
+		await this.reconcile(files.map((f) => f.path));
+		const added = files.filter((f) => this.fileStates.get(f.path) === "add").length;
+		const name = files[0]?.name ?? "file";
+		new Notice(folderName
+			? `Added ${added}/${files.length} file(s) in ${folderName}`
+			: added ? `Added: ${name}` : `P4: couldn't add ${name}`);
+	}
+
+	/**
+	 * `p4 revert` a set of files — restores a staged deletion, discards edits,
+	 * or drops a pending add (the workspace file is kept in every case). Asks
+	 * first if any are open for edit, since reverting that discards real work.
+	 */
+	private async menuRevert(files: TFile[], folderName?: string): Promise<void> {
+		if (!files.length) return;
+		const name = files[0]?.name ?? "file";
+		const discardsEdits = files.some((f) => this.fileStates.get(f.path) === "edit");
+		if (discardsEdits) {
+			const what = folderName ? `open files in ${folderName}` : name;
+			if (!confirm(`Revert ${what}? This discards pending Perforce edits.`)) return;
+		}
+		const cfg = this.getP4Config();
+		await Promise.all(files.map((f) => p4Revert(this.absPath(f), cfg, this.vaultPath)));
+		await this.reconcile(files.map((f) => f.path));
+		new Notice(folderName
+			? `Reverted ${files.length} file(s) in ${folderName}`
+			: `Reverted: ${name}`);
 	}
 
 	private async onFileRename(file: TAbstractFile, oldPath: string): Promise<void> {

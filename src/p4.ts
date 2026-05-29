@@ -172,6 +172,47 @@ export async function p4Opened(
 	}
 }
 
+/**
+ * List the files under `cwd` (or the given `paths`) that exist in the depot,
+ * i.e. are tracked. Uses `p4 have`, whose lines read `<depotFile>#rev - <localPath>`;
+ * we keep the local path. Files opened only for `add` aren't synced yet, so they
+ * don't appear here — they're surfaced via `p4Opened` instead. Returns absolute
+ * local-OS paths.
+ */
+export async function p4Have(
+	config: P4Config,
+	cwd: string,
+	paths?: string[]
+): Promise<string[]> {
+	const parse = (stdout: string): string[] => {
+		const out: string[] = [];
+		for (const line of stdout.split("\n")) {
+			const m = line.match(/ - (.+)$/);
+			if (m && m[1]) out.push(m[1].trim());
+		}
+		return out;
+	};
+
+	if (paths && paths.length > 0) {
+		const results = await Promise.all(paths.map(async (p) => {
+			try {
+				const { stdout } = await runP4(`have "${p}"`, config, cwd);
+				return parse(stdout);
+			} catch {
+				return [];
+			}
+		}));
+		return results.flat();
+	}
+
+	try {
+		const { stdout } = await runP4("have ./...", config, cwd);
+		return parse(stdout);
+	} catch {
+		return [];
+	}
+}
+
 function parseOpenedRecords(
 	stdout: string
 ): { localPath: string; action: "edit" | "add" | "delete" }[] {
