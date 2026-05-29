@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-p4",
 	"name": "Perforce Integration",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"minAppVersion": "0.15.0",
 	"description": "Automatic Perforce checkout/revert for seamless editing of version-controlled files.",
 	"author": "Steffan Poulsen",

@@ -10,23 +10,47 @@ import {
 // A single left-edge bar encodes a file's P4 status; the title text keeps its
 // normal theme color. No bar = untracked; muted = tracked/clean; accent = open
 // for edit; green = open for add; red = marked for delete.
+//
+// The bar is drawn as a `::after` pseudo-element, not box-shadow/border: the
+// file explorer renders its hover/active/selected/drag highlight as a
+// positioned `::before` on the row, which would paint over a box-shadow. An
+// `::after` paints after (above) that `::before`, so the P4 bar always wins.
 const P4_STYLES = `
 .nav-file.p4-tracked > .nav-file-title,
-.tree-item.p4-tracked > .tree-item-self {
-	box-shadow: inset 3px 0 0 0 var(--text-muted);
-}
 .nav-file.p4-edit > .nav-file-title,
-.tree-item.p4-edit > .tree-item-self {
-	box-shadow: inset 3px 0 0 0 var(--text-accent);
-}
 .nav-file.p4-add > .nav-file-title,
-.tree-item.p4-add > .tree-item-self {
-	box-shadow: inset 3px 0 0 0 var(--color-green);
-}
 .nav-file.p4-delete > .nav-file-title,
+.tree-item.p4-tracked > .tree-item-self,
+.tree-item.p4-edit > .tree-item-self,
+.tree-item.p4-add > .tree-item-self,
 .tree-item.p4-delete > .tree-item-self {
-	box-shadow: inset 3px 0 0 0 var(--color-red);
+	position: relative;
 }
+.nav-file.p4-tracked > .nav-file-title::after,
+.nav-file.p4-edit > .nav-file-title::after,
+.nav-file.p4-add > .nav-file-title::after,
+.nav-file.p4-delete > .nav-file-title::after,
+.tree-item.p4-tracked > .tree-item-self::after,
+.tree-item.p4-edit > .tree-item-self::after,
+.tree-item.p4-add > .tree-item-self::after,
+.tree-item.p4-delete > .tree-item-self::after {
+	content: "";
+	position: absolute;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	width: 3px;
+	background-color: var(--p4-bar);
+	pointer-events: none;
+}
+.nav-file.p4-tracked > .nav-file-title,
+.tree-item.p4-tracked > .tree-item-self { --p4-bar: var(--text-muted); }
+.nav-file.p4-edit > .nav-file-title,
+.tree-item.p4-edit > .tree-item-self { --p4-bar: var(--text-accent); }
+.nav-file.p4-add > .nav-file-title,
+.tree-item.p4-add > .tree-item-self { --p4-bar: var(--color-green); }
+.nav-file.p4-delete > .nav-file-title,
+.tree-item.p4-delete > .tree-item-self { --p4-bar: var(--color-red); }
 `;
 
 /** A file's P4 status as reflected by the explorer bar. */
