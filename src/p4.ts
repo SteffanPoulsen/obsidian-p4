@@ -11,7 +11,14 @@ export interface P4Config {
 }
 
 export interface P4FileStatus {
-	/** Whether the file exists in the depot */
+	/**
+	 * Whether the file is synced into this workspace (has a have-revision) —
+	 * the same notion of "tracked" the sidebar uses (`p4 have`). A file that
+	 * has only a `depotFile` record but no have-rev — deleted at head, or a
+	 * depot path never synced into this workspace — reads as untracked, so
+	 * delete/rename fall through to plain-file handling instead of issuing a
+	 * p4 op the server would reject as "not on client".
+	 */
 	tracked: boolean;
 	/** Whether the file is currently opened for edit */
 	checkedOut: boolean;
@@ -254,9 +261,14 @@ export async function p4Fstat(
 ): Promise<P4FileStatus> {
 	try {
 		const { stdout } = await runP4(`fstat "${filePath}"`, config, cwd);
-		// Match the `action` field exactly — not `headAction` / `otherAction`.
-		// p4 fstat prints fields as `... <name> <value>` per line.
-		const tracked = /^\.\.\. depotFile /m.test(stdout);
+		// p4 fstat prints fields as `... <name> <value>` per line. Match each
+		// field exactly — e.g. `action`, not `headAction` / `otherAction`.
+		//
+		// `tracked` keys off `haveRev`, not `depotFile`: `depotFile` is present
+		// even for files deleted at head or never synced into this workspace,
+		// whereas `haveRev` is the precise "I have this synced" signal — the
+		// same files `p4 have` reports (the sidebar's tracked source).
+		const tracked = /^\.\.\. haveRev /m.test(stdout);
 		const checkedOut = /^\.\.\. action edit\b/m.test(stdout);
 		const openedForAdd = /^\.\.\. action add\b/m.test(stdout);
 		const openedForDelete = /^\.\.\. action (delete|move\/delete)\b/m.test(stdout);
