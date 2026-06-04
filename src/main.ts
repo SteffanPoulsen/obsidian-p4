@@ -1,10 +1,10 @@
-import { Menu, Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { App, Menu, Modal, Notice, Plugin, Setting, TAbstractFile, TFile, TFolder } from "obsidian";
 import { accessSync, chmodSync, constants, realpathSync, statSync } from "fs";
 import { join } from "path";
 import { DEFAULT_SETTINGS, P4PluginSettings, P4SettingTab } from "./settings";
 import {
-	p4Add, p4Delete, p4DeleteKeep, p4Edit, p4Fstat, p4Have, p4Info, p4Move, p4Opened,
-	p4Revert, p4RevertKeep, p4RevertUnchanged, P4Config, P4FileStatus,
+	p4Add, p4Delete, p4DeleteKeep, p4Edit, p4Fstat, p4Have, p4Info, p4Login, p4LoginStatus,
+	p4Move, p4Opened, p4Revert, p4RevertKeep, p4RevertUnchanged, P4AuthError, P4Config, P4FileStatus,
 } from "./p4";
 
 // A single left-edge bar encodes a file's P4 status; the title text keeps its
@@ -51,10 +51,77 @@ const P4_STYLES = `
 .tree-item.p4-add > .tree-item-self { --p4-bar: var(--color-green); }
 .nav-file.p4-delete > .nav-file-title,
 .tree-item.p4-delete > .tree-item-self { --p4-bar: var(--color-red); }
+
+/* Connection dot in the status-bar item (green = connected, red = down,
+   grey = working offline), like Obsidian Sync's indicator. */
+.p4-status-dot {
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	margin-right: 5px;
+	vertical-align: middle;
+	background-color: var(--text-muted);
+}
+.p4-status-dot.p4-dot-green { background-color: var(--color-green); }
+.p4-status-dot.p4-dot-red { background-color: var(--color-red); }
+.p4-status-dot.p4-dot-grey { background-color: var(--text-muted); }
 `;
 
 /** A file's P4 status as reflected by the explorer bar. */
 type P4Bar = "tracked" | "edit" | "add" | "delete";
+
+/**
+ * Prompts for a Perforce password to re-establish a login ticket. Calls back
+ * with the entered password, or `null` if dismissed without submitting.
+ */
+class P4LoginModal extends Modal {
+	private readonly onSubmit: (password: string | null) => void;
+	private value = "";
+	private resolved = false;
+
+	constructor(app: App, onSubmit: (password: string | null) => void) {
+		super(app);
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("Perforce login");
+		const { contentEl } = this;
+		contentEl.createEl("p", {
+			text: "Your Perforce session has expired. Enter your password to log back in.",
+		});
+
+		new Setting(contentEl).setName("Password").addText((text) => {
+			text.inputEl.type = "password";
+			text.setPlaceholder("Perforce password");
+			text.onChange((v) => { this.value = v; });
+			text.inputEl.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") { e.preventDefault(); this.finish(this.value); }
+			});
+			window.setTimeout(() => text.inputEl.focus(), 0);
+		});
+
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("Log in").setCta().onClick(() => this.finish(this.value)))
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	private finish(password: string): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.onSubmit(password);
+		this.close();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		if (!this.resolved) {
+			this.resolved = true;
+			this.onSubmit(null);
+		}
+	}
+}
 
 export default class P4Plugin extends Plugin {
 	settings: P4PluginSettings = DEFAULT_SETTINGS;
@@ -62,11 +129,37 @@ export default class P4Plugin extends Plugin {
 	/** The file that was most recently open (so we can detect close/switch) */
 	private lastOpenFile: TFile | null = null;
 
-	/** Whether P4 server is reachable */
+	/** Whether P4 server is reachable (derived: connectionStatus === "connected"). */
 	private serverAvailable = false;
 
-	/** Status bar element */
+	/**
+	 * Connection state the status bar renders from; written only by
+	 * setConnectionState. "offline" is the voluntary Work-offline mode (guards
+	 * off, no automation); "expired"/"unreachable" are involuntary down states
+	 * that engage the fail-closed guards.
+	 */
+	private connectionStatus: "connected" | "unreachable" | "expired" | "offline" = "unreachable";
+
+	/** Guards against overlapping checkServer probes (e.g. window-focus storms). */
+	private checkInFlight = false;
+
+	/** Guards against overlapping heartbeat probes. */
+	private heartbeatInFlight = false;
+
+	/**
+	 * Set once the first connectivity probe has completed. Until then the status
+	 * is the unconfirmed initial "unreachable", so guards stay silent — warning
+	 * from that un-probed state would fire on every startup.
+	 */
+	private connectionProbed = false;
+
+	/** Last throttled warning shown, to suppress repeats for the same path. */
+	private lastWarn: { path: string; at: number } | null = null;
+
+	/** Status bar element, and the colored dot + text spans inside it. */
 	private statusBarEl: HTMLElement | null = null;
+	private statusDotEl: HTMLElement | null = null;
+	private statusTextEl: HTMLElement | null = null;
 
 	/** Injected style element for file explorer coloring */
 	private styleEl: HTMLStyleElement | null = null;
@@ -100,12 +193,22 @@ export default class P4Plugin extends Plugin {
 		this.styleEl.textContent = P4_STYLES;
 		document.head.appendChild(this.styleEl);
 
-		// Status bar
-		this.statusBarEl = this.addStatusBarItem();
-		this.updateStatusBar(null);
+		// Status bar — a colored connection dot + text, clickable to toggle
+		// Work-offline / reconnect.
+		const statusBarEl = this.addStatusBarItem();
+		this.statusBarEl = statusBarEl;
+		statusBarEl.addClass("mod-clickable");
+		this.statusDotEl = statusBarEl.createSpan({ cls: "p4-status-dot" });
+		this.statusTextEl = statusBarEl.createSpan({ cls: "p4-status-text" });
+		this.registerDomEvent(statusBarEl, "click", (e) => this.showStatusMenu(e));
+		this.setConnectionState("unreachable");
 
 		// Check P4 connectivity on startup
 		this.checkServer();
+
+		// Proactively detect a dropped session (and recover from one) on a timer,
+		// so the down-state is known before the user acts on it.
+		this.registerInterval(window.setInterval(() => this.heartbeat(), 30000));
 
 		// Make Obsidian's native delete P4-aware: tracked files are staged
 		// for delete and kept on disk (so they stay visible and turn red)
@@ -133,12 +236,18 @@ export default class P4Plugin extends Plugin {
 			})
 		);
 
-		// File lifecycle — p4 add / delete / move
-		this.registerEvent(
-			this.app.vault.on("create", (file) => {
-				this.onFileCreate(file);
-			})
-		);
+		// File lifecycle — p4 add / delete / move.
+		//
+		// Obsidian replays a `create` for every existing file while it loads the
+		// vault; registering this handler only once layout is ready means we see
+		// genuine post-load creations, not that startup replay.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.vault.on("create", (file) => {
+					this.onFileCreate(file);
+				})
+			);
+		});
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
@@ -156,7 +265,12 @@ export default class P4Plugin extends Plugin {
 		// Obsidian — catches state changes made outside the plugin
 		// (submits from p4v, reverts from CLI, etc.).
 		this.registerDomEvent(window, "focus", () => {
-			this.reconcile();
+			// Voluntary offline is a sink — don't auto-probe out of it.
+			if (this.connectionStatus === "offline") return;
+			// When down, re-probe so we recover once the user has re-logged in;
+			// otherwise just reconcile against ground truth.
+			if (this.serverAvailable) this.reconcile();
+			else this.checkServer();
 		});
 
 		// Manual commands
@@ -256,14 +370,56 @@ export default class P4Plugin extends Plugin {
 	}
 
 	private async checkServer(): Promise<void> {
-		const clientName = await p4Info(this.getP4Config(), this.vaultPath);
-		this.serverAvailable = clientName !== null;
-		this.updateStatusBar(clientName);
-		if (!this.serverAvailable) {
-			console.log("obsidian-p4: P4 server not reachable or not configured");
-			return;
+		if (this.checkInFlight) return;
+		// Voluntary offline is a true sink: nothing probes out of it (this also
+		// closes the saveSettings → checkServer leak). goOnline leaves the sink
+		// before calling here.
+		if (this.connectionStatus === "offline") return;
+		this.checkInFlight = true;
+		try {
+			const clientName = await p4Info(this.getP4Config(), this.vaultPath);
+			if (clientName === null) {
+				this.setConnectionState("unreachable");
+				console.log("obsidian-p4: P4 server not reachable or not configured");
+				return;
+			}
+			// Enable the gate so reconcile can probe with auth-requiring
+			// queries; it downgrades to "expired" (returning false) if the
+			// ticket is dead. Announce "connected" only once it comes back ok,
+			// so a repeated focus re-probe doesn't re-fire the expiry notice.
+			this.serverAvailable = true;
+			if (await this.reconcile()) {
+				this.setConnectionState("connected", clientName);
+			}
+		} finally {
+			this.checkInFlight = false;
+			this.connectionProbed = true;
 		}
-		await this.reconcile();
+	}
+
+	/**
+	 * Periodic liveness probe so a dropped session is detected before the user
+	 * acts on it. Skips voluntary offline (a sink) and a backgrounded window
+	 * (no point probing). When up, a cheap `login -s` confirms the ticket still
+	 * lives and downgrades to expired/unreachable on failure; when down, retry
+	 * checkServer to recover once the user has re-logged in.
+	 */
+	private async heartbeat(): Promise<void> {
+		if (this.heartbeatInFlight) return;
+		if (this.connectionStatus === "offline") return;
+		if (!document.hasFocus()) return;
+		this.heartbeatInFlight = true;
+		try {
+			if (this.serverAvailable) {
+				const status = await p4LoginStatus(this.getP4Config(), this.vaultPath);
+				if (status === "expired") this.setConnectionState("expired");
+				else if (status === "unreachable") this.setConnectionState("unreachable");
+			} else {
+				await this.checkServer();
+			}
+		} finally {
+			this.heartbeatInFlight = false;
+		}
 	}
 
 	/**
@@ -277,8 +433,8 @@ export default class P4Plugin extends Plugin {
 	 * - `paths` provided → scoped reconcile for just those vault paths. Any
 	 *   input path not reported by p4 is dropped from both maps.
 	 */
-	async reconcile(paths?: string[]): Promise<void> {
-		if (!this.serverAvailable) return;
+	async reconcile(paths?: string[]): Promise<boolean> {
+		if (!this.serverAvailable) return false;
 
 		const realVault = this.resolveRealPath(this.vaultPath);
 		const prefix = realVault.endsWith("/") ? realVault : realVault + "/";
@@ -289,10 +445,17 @@ export default class P4Plugin extends Plugin {
 		};
 
 		const queryPaths = paths?.map((p) => this.absPathFromVaultPath(p));
-		const [opened, have] = await Promise.all([
+		const result = await Promise.all([
 			p4Opened(this.getP4Config(), realVault, queryPaths),
 			p4Have(this.getP4Config(), realVault, queryPaths),
-		]);
+		]).catch((e) => {
+			// The only error the queries rethrow is auth: the ticket expired
+			// mid-session. Mark expired and leave bars/maps untouched.
+			if (e instanceof P4AuthError) this.setConnectionState("expired");
+			return null;
+		});
+		if (!result) return false;
+		const [opened, have] = result;
 
 		const newStates = new Map<string, "edit" | "add" | "delete">();
 		for (const { localPath, action } of opened) {
@@ -312,8 +475,10 @@ export default class P4Plugin extends Plugin {
 				...newStates.keys(), ...newTracked,
 			]);
 
+		const submittedDeletes: string[] = [];
 		for (const p of scope) {
 			const prevBar = this.barFor(p);
+			const wasDelete = this.fileStates.get(p) === "delete";
 
 			const nextState = newStates.get(p) ?? null;
 			if (nextState === null) this.fileStates.delete(p);
@@ -322,32 +487,178 @@ export default class P4Plugin extends Plugin {
 			if (newTracked.has(p)) this.trackedFiles.add(p);
 			else this.trackedFiles.delete(p);
 
+			// A staged delete that now shows no bar has either been submitted
+			// or reverted; confirm which before removing the kept -k copy.
+			if (wasDelete && this.barFor(p) === null) submittedDeletes.push(p);
+
 			// Only touch the DOM when the resulting bar actually changes.
 			if (this.barFor(p) !== prevBar) this.applyBar(p);
 		}
+
+		for (const p of submittedDeletes) {
+			await this.cleanupSubmittedDelete(p);
+		}
+		return true;
 	}
 
-	private updateStatusBar(clientName: string | null): void {
-		if (!this.statusBarEl) return;
-		if (clientName) {
-			this.statusBarEl.setText(`P4: ${clientName}`);
-		} else {
-			this.statusBarEl.setText("P4: disconnected");
+	/**
+	 * Remove the workspace copy a `delete -k` left behind, once the deletion
+	 * has actually been submitted. Confirms via fstat that the depot head is a
+	 * deletion and the file is no longer synced (`!tracked`) — a positive
+	 * signal, never inferred from absence in a query that may have failed — so
+	 * a flaky server can't cause a wrongful delete. A reverted delete still has
+	 * a have-rev, so it's kept. Trashed (recoverable), not permanently removed.
+	 */
+	private async cleanupSubmittedDelete(vaultPath: string): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile)) return; // already gone (e.g. move/delete source)
+
+		const status = await p4Fstat(this.absPath(file), this.getP4Config(), this.vaultPath);
+		if (!status.deletedAtHead || status.tracked) return;
+
+		// Honor the user's "Deleted files" preference for system trash, but
+		// never permanently delete — fall back to the vault's local .trash so
+		// an auto-removal is always recoverable.
+		const system = (this.app.vault as any).getConfig?.("trashOption") === "system";
+		await this.app.vault.trash(file, system);
+	}
+
+	/**
+	 * Single writer of connection state. Sets the derived `serverAvailable`
+	 * gate, renders the status bar, and announces an expiry once — on the
+	 * transition into "expired" — so a dead ticket can't pass unnoticed.
+	 */
+	private setConnectionState(
+		status: "connected" | "unreachable" | "expired" | "offline",
+		clientName?: string
+	): void {
+		const prev = this.connectionStatus;
+		this.connectionStatus = status;
+		this.serverAvailable = status === "connected";
+
+		if (this.statusTextEl) {
+			this.statusTextEl.setText(
+				status === "connected"
+					? `P4: ${clientName ?? "connected"}`
+					: status === "offline"
+						? "P4: working offline"
+						: status === "expired"
+							? "P4: session expired"
+							: "P4: disconnected"
+			);
+		}
+		if (this.statusDotEl) {
+			this.statusDotEl.classList.remove("p4-dot-green", "p4-dot-red", "p4-dot-grey");
+			this.statusDotEl.classList.add(
+				status === "connected" ? "p4-dot-green"
+					: status === "offline" ? "p4-dot-grey"
+						: "p4-dot-red"
+			);
+		}
+
+		if (status === "expired" && prev !== "expired") {
+			new Notice(
+				"Perforce session expired — run 'p4 login', then use the " +
+				"'Reconnect to Perforce server' command.",
+				8000
+			);
+		}
+
+		if (status === "offline" && prev !== "offline") {
+			new Notice("Working offline — Perforce paused; reconnect to resume", 5000);
 		}
 	}
 
 	private async reconnect(): Promise<void> {
-		new Notice("P4: reconnecting...", 1500);
+		new Notice("P4: reconnecting…", 1500);
 		await this.checkServer();
 		if (this.serverAvailable) {
 			new Notice("P4: connected", 2000);
+		} else if (this.connectionStatus === "expired") {
+			// Reached the server but the ticket is dead — only a login fixes it.
+			this.promptLogin();
 		} else {
-			new Notice("P4: connection failed", 3000);
+			new Notice("P4: can't reach the Perforce server — check P4PORT / network", 5000);
+		}
+	}
+
+	/**
+	 * Prompt for a password, run `p4 login`, and re-probe on success. The
+	 * password is handed straight to p4 and never stored; a wrong password or
+	 * unreachable server surfaces as a toast with p4's own reason.
+	 */
+	private promptLogin(): void {
+		new P4LoginModal(this.app, async (password) => {
+			if (!password) return; // dismissed or empty
+			new Notice("P4: logging in…", 1500);
+			const result = await p4Login(this.getP4Config(), this.vaultPath, password);
+			if (!result.ok) {
+				new Notice(`P4: login failed — ${result.message}`, 6000);
+				return;
+			}
+			await this.checkServer();
+			new Notice(
+				this.serverAvailable
+					? "P4: logged in"
+					: "P4: logged in, but couldn't reconnect — try again",
+				3000
+			);
+		}).open();
+	}
+
+	// ── Status-bar control (Work offline / reconnect) ────────────────
+
+	/** Menu shown when the status-bar item is clicked. */
+	private showStatusMenu(evt: MouseEvent): void {
+		const menu = new Menu();
+		if (this.connectionStatus === "offline") {
+			menu.addItem((item) =>
+				item.setTitle("Connect to Perforce").setIcon("plug-zap")
+					.onClick(() => { void this.goOnline(); })
+			);
+		} else {
+			// An expired ticket needs a login; an unreachable server needs a
+			// re-probe. Neither shows when we're already connected.
+			if (this.connectionStatus === "expired") {
+				menu.addItem((item) =>
+					item.setTitle("Log in to Perforce…").setIcon("log-in")
+						.onClick(() => this.promptLogin())
+				);
+			} else if (!this.serverAvailable) {
+				menu.addItem((item) =>
+					item.setTitle("Reconnect").setIcon("refresh-cw")
+						.onClick(() => { void this.reconnect(); })
+				);
+			}
+			menu.addItem((item) =>
+				item.setTitle("Work offline").setIcon("plug")
+					.onClick(() => this.workOffline())
+			);
+		}
+		menu.showAtMouseEvent(evt);
+	}
+
+	/** Enter voluntary Work-offline mode: guards off, no automation. */
+	private workOffline(): void {
+		this.setConnectionState("offline");
+	}
+
+	/**
+	 * Leave Work-offline and try to reconnect. Drops the sink first so
+	 * checkServer's offline early-return doesn't refuse to run; a failed probe
+	 * lands in unreachable, where the heartbeat keeps retrying.
+	 */
+	private async goOnline(): Promise<void> {
+		this.setConnectionState("unreachable");
+		await this.checkServer();
+		if (!this.serverAvailable) {
+			new Notice("P4: still offline — couldn't reconnect", 3000);
 		}
 	}
 
 	private shouldHandle(path: string): boolean {
 		if (path.startsWith(".obsidian/")) return false;
+		if (path.startsWith(".trash/")) return false;
 		return true;
 	}
 
@@ -358,6 +669,39 @@ export default class P4Plugin extends Plugin {
 		} catch {
 			return true;
 		}
+	}
+
+	/**
+	 * Whether the fail-closed guards are active: P4 is involuntarily down
+	 * (expired or unreachable) and the user hasn't deliberately gone offline.
+	 * Derived from the boolean, not the status enum, so it drops the instant a
+	 * reconnecting checkServer raw-sets `serverAvailable` — no spurious "locked"
+	 * warning during the reconnect tick.
+	 */
+	private guardsEngaged(): boolean {
+		return !this.serverAvailable && this.connectionStatus !== "offline";
+	}
+
+	/** Add the owner-write bit so an imminent write lands on a writable file. */
+	private makeWritable(abs: string): void {
+		try {
+			chmodSync(abs, statSync(abs).mode | 0o200);
+		} catch (e) {
+			console.warn(`obsidian-p4: chmod +w failed for ${abs}`, e);
+		}
+	}
+
+	/**
+	 * Show a Notice, suppressing a repeat for the same path within ~10s so a
+	 * burst of opens/creates against a downed server doesn't spam the user.
+	 */
+	private warnThrottled(path: string, msg: string): void {
+		const now = Date.now();
+		if (this.lastWarn && this.lastWarn.path === path && now - this.lastWarn.at < 10000) {
+			return;
+		}
+		this.lastWarn = { path, at: now };
+		new Notice(msg, 5000);
 	}
 
 	// ── File explorer bars ──────────────────────────────────────────
@@ -418,10 +762,26 @@ export default class P4Plugin extends Plugin {
 
 		this.lastOpenFile = file;
 
-		if (!file || !this.serverAvailable) return;
+		if (!file) return;
 		if (!this.shouldHandle(file.path)) return;
 
 		const abs = this.absPath(file);
+
+		// Work-offline: auto-unlock so the file is editable. No p4 edit —
+		// reconcile-on-reconnect picks up whatever changed.
+		if (this.connectionStatus === "offline") {
+			if (this.isReadOnly(abs)) this.makeWritable(abs);
+			return;
+		}
+
+		// Involuntarily down: keep the file locked and say so, rather than let an
+		// edit accumulate against a server that can't accept the checkout.
+		if (this.guardsEngaged()) {
+			if (this.connectionProbed && this.isReadOnly(abs)) {
+				this.warnThrottled(file.path, `Perforce offline — ${file.name} is locked`);
+			}
+			return;
+		}
 
 		// Only checkout if the file is read-only (P4's default state)
 		if (!this.isReadOnly(abs)) return;
@@ -447,9 +807,20 @@ export default class P4Plugin extends Plugin {
 	// ── File lifecycle (create / delete / rename) ───────────────────
 
 	private async onFileCreate(file: TAbstractFile): Promise<void> {
-		if (!this.serverAvailable) return;
 		if (!(file instanceof TFile)) return;
 		if (!this.shouldHandle(file.path)) return;
+
+		// Voluntary offline: no automation, no noise.
+		if (this.connectionStatus === "offline") return;
+
+		// Involuntarily down: the file lands untracked and reconcile-on-reconnect
+		// won't add it, so warn that it needs a manual Add once back online.
+		if (this.guardsEngaged()) {
+			if (this.connectionProbed) {
+				this.warnThrottled(file.path, `${file.name} created while Perforce offline — not tracked`);
+			}
+			return;
+		}
 
 		const abs = this.absPath(file);
 		await p4Add(abs, this.getP4Config(), this.vaultPath);
@@ -508,8 +879,17 @@ export default class P4Plugin extends Plugin {
 	}
 
 	private async handleDeletePrompt(file: TAbstractFile): Promise<boolean> {
-		if (!this.serverAvailable || !this.shouldHandle(file.path)) {
+		if (!this.shouldHandle(file.path)) {
 			return this.callOriginalDelete(file);
+		}
+		// Voluntary offline: guards off, you're on your own — normal delete.
+		if (this.connectionStatus === "offline") {
+			return this.callOriginalDelete(file);
+		}
+		// Involuntarily down: block deleting anything P4 is managing so a
+		// deletion can't silently diverge from the depot.
+		if (this.guardsEngaged()) {
+			return this.blockDeleteWhileOffline(file);
 		}
 		try {
 			if (file instanceof TFolder) return await this.markFolderForDelete(file);
@@ -519,6 +899,39 @@ export default class P4Plugin extends Plugin {
 			console.error("obsidian-p4: mark-for-delete failed", e);
 			new Notice(`P4: couldn't mark ${file.name} for delete — left in place`);
 			return false;
+		}
+		return this.callOriginalDelete(file);
+	}
+
+	/**
+	 * Whether a file looks P4-managed using only offline-safe signals: the live
+	 * on-disk read-only bit (P4's locked state) plus the cached open/tracked
+	 * maps. No server call, so it's usable while down.
+	 */
+	private isManagedOffline(file: TFile): boolean {
+		return (
+			this.isReadOnly(this.absPath(file)) ||
+			this.fileStates.has(file.path) ||
+			this.trackedFiles.has(file.path)
+		);
+	}
+
+	/**
+	 * Delete handler while involuntarily down. Blocks deletion of anything P4 is
+	 * managing — a folder counts as managed if any file under it is — so a
+	 * deletion can't slip past the depot; a writable, untracked scratch file
+	 * falls through to a normal delete.
+	 */
+	private blockDeleteWhileOffline(file: TAbstractFile): Promise<boolean> {
+		const managed = file instanceof TFolder
+			? this.collectFiles(file).some((c) => this.isManagedOffline(c))
+			: file instanceof TFile
+				? this.isManagedOffline(file)
+				: false;
+
+		if (managed) {
+			new Notice(`Perforce offline — can't delete ${file.name}, reconnect first`, 5000);
+			return Promise.resolve(false);
 		}
 		return this.callOriginalDelete(file);
 	}
@@ -735,12 +1148,7 @@ export default class P4Plugin extends Plugin {
 			// p4 move -k skipped the workspace operation, so the new path
 			// is still read-only on disk. Flip it ourselves — harmless if
 			// the move call quietly failed, and necessary if it succeeded.
-			try {
-				const mode = statSync(absNew).mode;
-				chmodSync(absNew, mode | 0o200);
-			} catch (e) {
-				console.warn(`obsidian-p4: chmod +w failed for ${file.path}`, e);
-			}
+			this.makeWritable(absNew);
 		} else {
 			await p4Add(absNew, this.getP4Config(), this.vaultPath);
 		}
@@ -796,11 +1204,11 @@ export default class P4Plugin extends Plugin {
 		let originalMode: number;
 		try {
 			originalMode = statSync(abs).mode;
-			chmodSync(abs, originalMode | 0o200);
 		} catch (e) {
-			console.warn(`obsidian-p4: chmod +w failed for ${vaultPath}`, e);
+			console.warn(`obsidian-p4: stat failed for ${vaultPath}`, e);
 			return;
 		}
+		this.makeWritable(abs);
 
 		await p4Edit(abs, this.getP4Config(), this.vaultPath);
 		await this.reconcile([vaultPath]);
