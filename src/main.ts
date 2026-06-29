@@ -215,10 +215,21 @@ export default class P4Plugin extends Plugin {
 		// instead of being removed outright. See patchDeletePrompt.
 		this.patchDeletePrompt();
 
-		// Auto-checkout when a file is opened
+		// Track the open file so we can revert it on switch if it's unchanged.
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
 				this.onFileOpen(file);
+			})
+		);
+
+		// Checkout on first edit, not on open: a tracked file stays read-only
+		// (just the muted "tracked" bar) until the user actually changes it, at
+		// which point we unlock it and open it for edit. Reading no longer
+		// checks a file out.
+		this.registerEvent(
+			this.app.workspace.on("editor-change", (_editor, info) => {
+				const file = info.file;
+				if (file) this.ensureCheckedOut(file);
 			})
 		);
 
@@ -691,6 +702,15 @@ export default class P4Plugin extends Plugin {
 		}
 	}
 
+	/** Clear the write bits, restoring P4's locked (read-only) state. */
+	private makeReadOnly(abs: string): void {
+		try {
+			chmodSync(abs, statSync(abs).mode & ~0o222);
+		} catch (e) {
+			console.warn(`obsidian-p4: chmod -w failed for ${abs}`, e);
+		}
+	}
+
 	/**
 	 * Show a Notice, suppressing a repeat for the same path within ~10s so a
 	 * burst of opens/creates against a downed server doesn't spam the user.
@@ -752,46 +772,75 @@ export default class P4Plugin extends Plugin {
 		}
 	}
 
-	// ── Auto-checkout on file open ──────────────────────────────────
+	// ── Checkout on edit ────────────────────────────────────────────
+	//
+	// A tracked file is left read-only when merely opened — it just shows the
+	// muted "tracked" bar. The checkout happens on the first edit (the
+	// editor-change event), so reading a file never opens it for edit. The two
+	// reverts still keep the pending changelist clean: revert-if-unchanged when
+	// switching away (below), and again on unload.
 
 	private async onFileOpen(file: TFile | null): Promise<void> {
-		// Revert previous file if unchanged (compares against depot)
+		// Revert the file we're leaving if it's unchanged vs depot, so a
+		// touched-then-undone file doesn't linger open for edit.
 		if (this.lastOpenFile && this.lastOpenFile !== file) {
 			await this.revertIfUnchanged(this.lastOpenFile);
 		}
-
 		this.lastOpenFile = file;
+	}
 
-		if (!file) return;
+	/**
+	 * First-edit checkout. Fired on editor-change (every content edit), it
+	 * unlocks and opens a tracked file the moment the user starts changing it.
+	 * The synchronous chmod makes the file writable in time for Obsidian's
+	 * imminent (debounced) autosave; the async p4 edit registers the open. The
+	 * read-only check doubles as the keystroke-storm guard — once the first edit
+	 * unlocks the file, every later keystroke short-circuits here.
+	 */
+	private ensureCheckedOut(file: TFile): void {
 		if (!this.shouldHandle(file.path)) return;
+		if (this.fileStates.has(file.path)) return; // already open for edit/add
 
 		const abs = this.absPath(file);
+		if (!this.isReadOnly(abs)) return; // untracked or already unlocked
 
-		// Work-offline: auto-unlock so the file is editable. No p4 edit —
-		// reconcile-on-reconnect picks up whatever changed.
+		// Work-offline: just unlock so the edit can save. No p4 edit — the same
+		// no-server semantics as before, only deferred to the actual edit.
 		if (this.connectionStatus === "offline") {
-			if (this.isReadOnly(abs)) this.makeWritable(abs);
+			this.makeWritable(abs);
 			return;
 		}
 
 		// Involuntarily down: keep the file locked and say so, rather than let an
 		// edit accumulate against a server that can't accept the checkout.
 		if (this.guardsEngaged()) {
-			if (this.connectionProbed && this.isReadOnly(abs)) {
+			if (this.connectionProbed) {
 				this.warnThrottled(file.path, `Perforce offline — ${file.name} is locked`);
 			}
 			return;
 		}
 
-		// Only checkout if the file is read-only (P4's default state)
-		if (!this.isReadOnly(abs)) return;
+		this.makeWritable(abs); // sync: the imminent autosave lands on a writable file
+		void this.checkoutForEdit(file); // async: register the open with p4
+	}
 
-		// Check if this file is actually tracked in P4
+	/**
+	 * Register the open with P4 after ensureCheckedOut unlocked the file. Only a
+	 * tracked, not-yet-open file needs `p4 edit`; an untracked one is the create
+	 * handler's job. If nothing ends up open (server rejected it, or the file
+	 * wasn't really tracked), re-lock it so a checkout that didn't land fails the
+	 * save loudly rather than diverging silently — an on-disk edit P4 never opened.
+	 */
+	private async checkoutForEdit(file: TFile): Promise<void> {
+		const abs = this.absPath(file);
 		const status = await p4Fstat(abs, this.getP4Config(), this.vaultPath);
-		if (!status.tracked || status.checkedOut || status.openedForDelete) return;
-
-		await p4Edit(abs, this.getP4Config(), this.vaultPath);
-		await this.reconcile([file.path]);
+		if (status.tracked && !status.checkedOut && !status.openedForAdd && !status.openedForDelete) {
+			await p4Edit(abs, this.getP4Config(), this.vaultPath);
+			await this.reconcile([file.path]);
+		}
+		if (!this.fileStates.has(file.path)) {
+			this.makeReadOnly(abs);
+		}
 	}
 
 	/** Let P4 decide if the file differs from depot — revert if not. */
