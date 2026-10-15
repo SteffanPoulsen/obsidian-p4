@@ -43,3 +43,13 @@ Three files in `src/`, bundled into a single `main.js` (CommonJS, es2018). `obsi
 ### Environment handed to `p4`
 
 `p4.ts:buildEnv` copies `process.env`. In `.p4config` mode it walks up from the vault base path to the nearest `.p4config`, injects its `KEY=VALUE` pairs, and sets `P4CONFIG=.p4config`, so the connection doesn't depend on variables being present in Obsidian's GUI environment. Manual mode injects `P4PORT`/`P4CLIENT`/`P4USER` from settings. `cwd` for every `p4` invocation is the vault base path.
+
+## Releasing
+
+Pushing a tag builds and publishes a GitHub release (`.github/workflows/release.yml`), attaching `main.js` and `manifest.json`; `main.js` is gitignored, so the release artifact is always built in CI. Obsidian matches the tag to `manifest.json`'s version, without a `v` prefix, and the workflow fails if they differ. To cut a release:
+
+1. Set the new version in `manifest.json`, `package.json`, and both top-level `version` fields of `package-lock.json`, and add it to `versions.json` mapped to the minimum Obsidian version.
+2. Commit and push.
+3. `git tag -a <version>` with the release notes as the tag message, then `git push origin <version>`. The workflow takes the notes from the annotation.
+
+Versioning is 0.x semver: new features or behavior changes bump the minor, fixes the patch. Bump when a change lands, and release once a minor version's worth of changes is in.
